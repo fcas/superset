@@ -54,7 +54,7 @@ setup(
         'flask-wtf==0.14.2',
         'future>=0.16.0, <0.17',
         'humanize==0.5.1',
-        'gunicorn==19.7.1',
+        'gunicorn==22.0.0',
         'markdown==2.6.8',
         'pandas==0.19.2',
         'parsedatetime==2.0.0',
