@@ -66,7 +66,7 @@ setup(
         'six==1.10.0',
         'sqlalchemy==1.1.9',
         'sqlalchemy-utils==0.32.14',
-        'sqlparse==0.2.3',
+        'sqlparse==0.5.0',
         'thrift>=0.9.3',
         'thrift-sasl>=0.2.1',
     ],
