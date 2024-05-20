@@ -61,7 +61,7 @@ setup(
         'pydruid==0.3.1',
         'PyHive>=0.3.0',
         'python-dateutil==2.6.0',
-        'requests==2.13.0',
+        'requests==2.32.0',
         'simplejson==3.10.0',
         'six==1.10.0',
         'sqlalchemy==1.1.9',
