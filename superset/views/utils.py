@@ -1,0 +1,684 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+import contextlib
+import logging
+from collections import defaultdict
+from functools import wraps
+from typing import Any, Callable, DefaultDict, Optional, Union
+from urllib import parse
+
+import msgpack
+import pyarrow as pa
+from flask import (
+    current_app as app,
+    g,
+    has_request_context,
+    redirect,
+    request,
+    url_for,
+)
+from flask_appbuilder.security.sqla import models as ab_models
+from flask_appbuilder.security.sqla.models import User
+from flask_babel import _
+from werkzeug.exceptions import BadRequest
+
+from superset import appbuilder, dataframe, db, result_set
+from superset.charts.data.dashboard_filter_context import (
+    get_dashboard_filter_context,
+)
+from superset.common.db_query_status import QueryStatus
+from superset.exceptions import (
+    SerializationError,
+    SupersetException,
+)
+from superset.extensions import security_manager
+from superset.legacy import update_time_range
+from superset.models.core import Database
+from superset.models.dashboard import Dashboard
+from superset.models.slice import Slice
+from superset.models.sql_lab import Query
+from superset.superset_typing import (
+    ExplorableData,
+    FlaskResponse,
+    FormData,
+)
+from superset.utils import json
+from superset.utils.core import DatasourceType
+from superset.utils.decorators import stats_timing
+
+logger = logging.getLogger(__name__)
+stats_logger = app.config["STATS_LOGGER"]
+
+
+def redirect_to_login(next_target: str | None = None) -> FlaskResponse:
+    """Return a redirect response to the login view, preserving target URL.
+
+    When ``next_target`` is ``None`` the current request path (including query
+    string) is used, provided a request context is available. The resulting URL
+    always remains relative, mirroring Flask-AppBuilder expectations.
+    """
+
+    login_url = appbuilder.get_url_for_login
+    parsed = parse.urlparse(login_url)
+    query = parse.parse_qs(parsed.query, keep_blank_values=True)
+
+    target = next_target
+    if target is None and has_request_context():
+        if request.query_string:
+            target = request.script_root + request.full_path.rstrip("?")
+        else:
+            target = request.script_root + request.path
+
+    if target:
+        query["next"] = [target]
+
+    encoded_query = parse.urlencode(query, doseq=True)
+    redirect_url = parse.urlunparse(parsed._replace(query=encoded_query))
+    return redirect(redirect_url)
+
+
+def sanitize_datasource_data(
+    datasource_data: ExplorableData,
+) -> dict[str, Any]:
+    """
+    Sanitize datasource data by removing sensitive database parameters.
+    """
+    if datasource_data:
+        datasource_database = datasource_data.get("database")
+        if datasource_database:
+            datasource_database["parameters"] = {}
+
+    return datasource_data  # type: ignore[return-value]
+
+
+def bootstrap_user_data(user: User, include_perms: bool = False) -> dict[str, Any]:
+    if user.is_anonymous:
+        payload = {}
+        user.roles = (security_manager.get_public_role(),)
+    elif security_manager.is_guest_user(user):
+        payload = {
+            "username": user.username,
+            "firstName": user.first_name,
+            "lastName": user.last_name,
+            "isActive": user.is_active,
+            "isAnonymous": user.is_anonymous,
+        }
+    else:
+        payload = {
+            "username": user.username,
+            "firstName": user.first_name,
+            "lastName": user.last_name,
+            "userId": user.id,
+            "isActive": user.is_active,
+            "isAnonymous": user.is_anonymous,
+            "createdOn": user.created_on.isoformat(),
+            "email": user.email,
+            "loginCount": user.login_count,
+        }
+
+    if include_perms:
+        roles, permissions = get_permissions(user)
+        payload["roles"] = roles
+        payload["permissions"] = permissions
+        payload["groups"] = [group.name for group in getattr(user, "groups", [])]
+
+    return payload
+
+
+def get_config_value(key: str) -> Any:
+    value = app.config[key]
+    return value() if callable(value) else value
+
+
+def get_permissions(
+    user: User,
+) -> tuple[dict[str, list[tuple[str]]], DefaultDict[str, list[str]]]:
+    if not user.roles and not user.groups:
+        raise AttributeError("User object does not have roles or groups")
+
+    data_permissions = defaultdict(set)
+    roles_permissions = security_manager.get_user_roles_permissions(user)
+    for _, permissions in roles_permissions.items():  # noqa: F402
+        for permission in permissions:
+            if permission[0] in ("datasource_access", "database_access"):
+                data_permissions[permission[0]].add(permission[1])
+    transformed_permissions = defaultdict(list)
+    for perm in data_permissions:
+        transformed_permissions[perm] = list(data_permissions[perm])
+    return roles_permissions, transformed_permissions
+
+
+def loads_request_json(request_json_data: str) -> dict[Any, Any]:
+    """Parse a JSON request payload, coercing non-objects to ``{}``.
+
+    Callers (notably ``get_form_data``) chain ``.update()`` / ``.get()`` on
+    the result assuming a dict. A bare scalar payload (``form_data=42``)
+    used to surface as ``TypeError: 'int' object is not iterable`` inside
+    ``event_logger.log_this`` and bubble out as 500.
+    """
+    try:
+        parsed = json.loads(request_json_data)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def get_request_json_body() -> dict[Any, Any]:
+    """Parse the request body as JSON, coercing failures to ``{}``.
+
+    ``request.is_json`` only inspects the Content-Type header, not whether the
+    body is actually parseable JSON. Callers reaching ``get_form_data`` from a
+    non-HTTP-chart-data context (e.g. an MCP tool call rendering
+    ``filter_values()``) can have a request context whose Content-Type claims
+    JSON but whose body isn't a JSON chart-data payload, which makes Werkzeug
+    raise ``BadRequest`` from ``request.get_json()``. A well-formed but
+    non-object JSON body (e.g. ``null``, a scalar, or an array) is coerced to
+    ``{}`` too, since callers treat the result as a mapping.
+    """
+    if not request.is_json:
+        return {}
+    try:
+        data = request.get_json(cache=True)
+    except BadRequest:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+#: Parameter names `url_for` interprets itself rather than appending to the
+#: query string. Request-supplied query keys matching these must never be
+#: forwarded as `url_for` kwargs.
+_RESERVED_URL_FOR_KWARGS = frozenset(
+    {"endpoint", "_external", "_scheme", "_anchor", "_method"}
+)
+
+
+def get_explore_redirect_url() -> str | None:  # noqa: C901
+    """Construct the `/explore/?form_data_key=...` redirect URL, or None.
+
+    Returns ``None`` when the request should render the SPA fall-through
+    instead of redirecting — covers all of:
+    - no/empty/non-dict ``form_data``;
+    - ``form_data`` missing a ``datasource`` (e.g. legacy ``slice_url``
+      payloads carrying only ``slice_id``);
+    - ``datasource`` that doesn't decompose as ``"<id>__<type>"``;
+    - ``datasource`` whose type is not a valid ``DatasourceType``;
+    - cache-write failure (``CreateFormDataCommand.run`` raises
+      ``ValueError``) — avoid 302-looping when the cache layer is down;
+    - the current request already matches the would-be redirect target
+      (loop guard via ``(endpoint, sorted(query_items))`` equality).
+
+    Single source of truth for the form_data → form_data_key cache-and-
+    redirect contract; both ``ExploreView.root`` (``views/explore.py``)
+    and the deprecated ``Superset.explore`` GET branch
+    (``views/core.py``) call this and redirect only when it returns a URL.
+    """
+    # Local imports break a circular dependency: `views/utils.py` is imported
+    # transitively by `commands/base.py`'s dependency graph, so importing
+    # `CreateFormDataCommand` at module level would loop back through this
+    # file before initialisation finishes (matches the prior inline
+    # `from superset.views.core import Superset` pattern in `views/explore.py`).
+    from superset.commands.explore.form_data.create import (  # noqa: PLC0415
+        CreateFormDataCommand,
+    )
+    from superset.commands.explore.form_data.parameters import (  # noqa: PLC0415
+        CommandParameters,
+    )
+
+    request_form_data = request.args.get("form_data")
+    if not request_form_data:
+        return None
+    # `loads_request_json` coerces any non-object payload (scalar, list) to
+    # `{}`, so a non-dict `form_data` falls through to the `not datasource`
+    # guard below — no separate isinstance check is needed here.
+    parsed_form_data = loads_request_json(request_form_data)
+    datasource = parsed_form_data.get("datasource")
+    if not datasource:
+        return None
+    if not isinstance(datasource, str):
+        # Malformed `form_data.datasource` of a
+        # non-string shape (number, list, dict) used to raise
+        # `AttributeError: ... has no attribute 'split'` and surface as 500.
+        return None
+
+    parts = datasource.split("__")
+    if len(parts) != 2:
+        # Malformed `datasource` (missing the `__type` suffix) used to
+        # raise `ValueError: not enough values to unpack` and surface as 500.
+        return None
+    datasource_id_str, datasource_type_str = parts
+    try:
+        datasource_type_enum = DatasourceType(datasource_type_str)
+    except ValueError:
+        # An unknown `datasource_type` used to raise `ValueError` from
+        # `DatasourceType(...)` and surface as 500. Fall through to SPA.
+        return None
+    try:
+        datasource_id = int(datasource_id_str)
+    except ValueError:
+        # Non-integer `datasource_id` (e.g. `"abc__table"`)
+        # would crash deeper inside the form-data write. Fall through to SPA.
+        return None
+
+    slice_id = parsed_form_data.get("slice_id")
+    if not isinstance(slice_id, int) or isinstance(slice_id, bool):
+        # A non-int, non-None `form_data.slice_id` (`"abc"`, `[1, 2]`, `{}`,
+        # `True`) used to survive the `is None` guard and surface as 500
+        # downstream when `CommandParameters(chart_id=...)` reached the
+        # cache write. Treat any non-int shape the same as missing and
+        # fall back to the typed query parse. `bool` is excluded because
+        # it is a subclass of `int` in Python — `True` would otherwise
+        # become `chart_id=1`.
+        # Previously `int(request.args.get("slice_id", 0))` blew up on
+        # non-numeric values (`?slice_id=abc`). `type=int` returns None on
+        # parse failure; coerce to 0 to preserve historical default.
+        slice_id = request.args.get("slice_id", type=int) or 0
+
+    parameters = CommandParameters(
+        datasource_id=datasource_id,
+        datasource_type=datasource_type_enum,
+        chart_id=slice_id,
+        form_data=request_form_data,
+    )
+    try:
+        form_data_key = CreateFormDataCommand(parameters).run()
+    except ValueError:
+        # Narrow catch: cache-write failure renders SPA instead of looping.
+        # `SQLAlchemyError` remains caught inside `CreateFormDataCommand.run`.
+        return None
+
+    # Use `url_for` with the query as kwargs so subdirectory deployments
+    # inherit SCRIPT_NAME *and* CodeQL sees a sanctioned Flask URL builder
+    # (the prior `f"{url_for(...)}?{urlencode(...)}"` form tripped
+    # `py/url-redirection` because string concatenation isn't recognised
+    # as sanitization). The endpoint params here (slice_id, dataset_id,
+    # form_data_key, ...) are single-valued; we keep the first value if a
+    # caller ever repeats a key so `url_for` receives scalars, not lists.
+    raw_query_string = request.query_string.decode()
+    query_multi = parse.parse_qs(raw_query_string)
+    if form_data_key:
+        query_multi.pop("form_data", None)
+        query_multi["form_data_key"] = [form_data_key]
+    # Drop keys that collide with `url_for`'s own parameters: a query string
+    # like `?_external=1&_scheme=ftp` would otherwise steer URL building
+    # (absolute URLs, scheme injection, fragment injection), and `?endpoint=x`
+    # would raise TypeError on the duplicated positional argument.
+    query: dict[str, str] = {
+        k: vals[0]
+        for k, vals in query_multi.items()
+        if vals and k not in _RESERVED_URL_FOR_KWARGS
+    }
+    target_url = url_for("ExploreView.root", **query)
+
+    # Loop guard: if the current request is already at the redirect target
+    # (same endpoint, same sorted query items), render the SPA instead of
+    # 302-looping. Compare on `(endpoint, sorted_query_items)` rather than
+    # `full_path` so SCRIPT_NAME (subdir deployment) is irrelevant.
+    current_query_items = sorted(parse.parse_qsl(raw_query_string))
+    target_query_items = sorted(query.items())
+    if (
+        request.endpoint == "ExploreView.root"
+        and current_query_items == target_query_items
+    ):
+        return None
+
+    return target_url
+
+
+def get_form_data(
+    slice_id: Optional[int] = None,
+    use_slice_data: bool = False,
+    initial_form_data: Optional[dict[str, Any]] = None,
+) -> tuple[dict[str, Any], Optional[Slice]]:
+    form_data: dict[str, Any] = initial_form_data or {}
+
+    if has_request_context():
+        json_data = get_request_json_body()
+
+        # chart data API requests are JSON
+        first_query = (
+            json_data["queries"][0]
+            if "queries" in json_data and json_data["queries"]
+            else None
+        )
+
+        add_sqllab_custom_filters(form_data)
+
+        request_form_data = request.form.get("form_data")
+        request_args_data = request.args.get("form_data")
+        if first_query:
+            form_data.update(first_query)
+        if request_form_data:
+            parsed_form_data = loads_request_json(request_form_data)
+            # some chart data api requests are form_data
+            queries = parsed_form_data.get("queries")
+            if isinstance(queries, list):
+                form_data.update(queries[0])
+            else:
+                form_data.update(parsed_form_data)
+        # request params can overwrite the body
+        if request_args_data:
+            form_data.update(loads_request_json(request_args_data))
+
+    # Fallback to using the Flask globals (used for cache warmup and async queries)
+    if not form_data and hasattr(g, "form_data"):
+        form_data = g.form_data
+        # chart data API requests are JSON
+        json_data = form_data["queries"][0] if "queries" in form_data else {}
+        form_data.update(json_data)
+
+    # When a slice_id is present, load from DB and override
+    # the form_data from the DB with the other form_data provided
+    slice_id = form_data.get("slice_id") or slice_id
+    slc = None
+
+    # Check if form data only contains slice_id, additional filters and viz type
+    valid_keys = ["slice_id", "extra_filters", "adhoc_filters", "viz_type"]
+    valid_slice_id = all(key in valid_keys for key in form_data)
+
+    # Include the slice_form_data if request from explore or slice calls
+    # or if form_data only contains slice_id and additional filters
+    if slice_id and (use_slice_data or valid_slice_id):
+        slc = db.session.query(Slice).filter_by(id=slice_id).one_or_none()
+        if slc and security_manager.can_access_chart(slc):
+            slice_form_data = slc.form_data.copy()
+            slice_form_data.update(form_data)
+            form_data = slice_form_data
+        else:
+            slc = None
+
+    update_time_range(form_data)
+    return form_data, slc
+
+
+def add_sqllab_custom_filters(form_data: dict[Any, Any]) -> Any:
+    """
+    SQLLab can include a "filters" attribute in the templateParams.
+    The filters attribute is a list of filters to include in the
+    request. Useful for testing templates in SQLLab.
+    """
+    try:
+        data = json.loads(request.data)
+        if isinstance(data, dict):
+            params_str = data.get("templateParams")
+            if isinstance(params_str, str):
+                params = json.loads(params_str)
+                if isinstance(params, dict):
+                    filters = params.get("_filters")
+                    if filters:
+                        form_data.update({"filters": filters})
+    except (TypeError, json.JSONDecodeError):
+        data = {}
+
+
+def get_datasource_info(
+    datasource_id: Optional[int], datasource_type: Optional[str], form_data: FormData
+) -> tuple[int, Optional[str]]:
+    """
+    Compatibility layer for handling of datasource info
+
+    datasource_id & datasource_type used to be passed in the URL
+    directory, now they should come as part of the form_data,
+
+    This function allows supporting both without duplicating code
+
+    :param datasource_id: The datasource ID
+    :param datasource_type: The datasource type
+    :param form_data: The URL form data
+    :returns: The datasource ID and type
+    :raises SupersetException: If the datasource no longer exists
+    """
+
+    if "__" in (datasource := form_data.get("datasource", "")):
+        datasource_id, datasource_type = datasource.split("__")
+        # The case where the datasource has been deleted
+        if datasource_id == "None":
+            datasource_id = None
+
+    if not datasource_id:
+        raise SupersetException(
+            _("The dataset associated with this chart no longer exists")
+        )
+
+    datasource_id = int(datasource_id)
+    return datasource_id, datasource_type
+
+
+def apply_display_max_row_limit(
+    sql_results: dict[str, Any], rows: Optional[int] = None
+) -> dict[str, Any]:
+    """
+    Given a `sql_results` nested structure, applies a limit to the number of rows
+
+    `sql_results` here is the nested structure coming out of sql_lab.get_sql_results, it
+    contains metadata about the query, as well as the data set returned by the query.
+    This method limits the number of rows adds a `displayLimitReached: True` flag to the
+    metadata.
+
+    :param sql_results: The results of a sql query from sql_lab.get_sql_results
+    :param rows: The number of rows to apply a limit to
+    :returns: The mutated sql_results structure
+    """
+
+    display_limit = rows or app.config["DISPLAY_MAX_ROW"]
+
+    if (
+        display_limit
+        and sql_results["status"] == QueryStatus.SUCCESS
+        and display_limit < sql_results["query"]["rows"]
+    ):
+        sql_results["data"] = sql_results["data"][:display_limit]
+        sql_results["displayLimitReached"] = True
+    return sql_results
+
+
+# see all dashboard components type in
+# /superset-frontend/src/dashboard/util/componentTypes.js
+CONTAINER_TYPES = ["COLUMN", "GRID", "TABS", "TAB", "ROW"]
+
+
+def get_dashboard_extra_filters(
+    slice_id: int, dashboard_id: int
+) -> list[dict[str, Any]]:
+    dashboard = db.session.query(Dashboard).filter_by(id=dashboard_id).one_or_none()
+
+    # is chart in this dashboard?
+    if (
+        dashboard is None
+        or not dashboard.json_metadata
+        or not dashboard.slices
+        or not any(slc for slc in dashboard.slices if slc.id == slice_id)
+    ):
+        return []
+
+    with contextlib.suppress(json.JSONDecodeError):
+        json_metadata = json.loads(dashboard.json_metadata)
+        native_filters = [
+            flt
+            for flt in get_dashboard_filter_context(
+                dashboard_id=dashboard_id,
+                chart_id=slice_id,
+            ).extra_form_data.get("filters", [])
+            if isinstance(flt, dict)
+        ]
+
+        # does this dashboard have legacy default filters?
+        default_filters = json.loads(json_metadata.get("default_filters", "null"))
+        if not default_filters:
+            return native_filters
+
+        # are default filters applicable to the given slice?
+        filter_scopes = json_metadata.get("filter_scopes", {})
+        layout = json.loads(dashboard.position_json or "{}")
+
+        if (
+            isinstance(layout, dict)
+            and isinstance(filter_scopes, dict)
+            and isinstance(default_filters, dict)
+        ):
+            return [
+                *build_extra_filters(
+                    layout,
+                    filter_scopes,
+                    default_filters,
+                    slice_id,
+                ),
+                *native_filters,
+            ]
+    return []
+
+
+def build_extra_filters(  # pylint: disable=too-many-locals,too-many-nested-blocks  # noqa: C901
+    layout: dict[str, dict[str, Any]],
+    filter_scopes: dict[str, dict[str, Any]],
+    default_filters: dict[str, dict[str, list[Any]]],
+    slice_id: int,
+) -> list[dict[str, Any]]:
+    extra_filters = []
+
+    # do not apply filters if chart is not in filter's scope or chart is immune to the
+    # filter.
+    for filter_id, columns in default_filters.items():
+        filter_slice = db.session.query(Slice).filter_by(id=filter_id).one_or_none()
+
+        filter_configs: list[dict[str, Any]] = []
+        if filter_slice:
+            filter_configs = (
+                json.loads(filter_slice.params or "{}").get("filter_configs") or []
+            )
+
+        scopes_by_filter_field = filter_scopes.get(filter_id, {})
+        for col, val in columns.items():
+            if not val:
+                continue
+
+            current_field_scopes = scopes_by_filter_field.get(col, {})
+            scoped_container_ids = current_field_scopes.get("scope", ["ROOT_ID"])
+            immune_slice_ids = current_field_scopes.get("immune", [])
+
+            for container_id in scoped_container_ids:
+                if slice_id not in immune_slice_ids and is_slice_in_container(
+                    layout, container_id, slice_id
+                ):
+                    # Ensure that the filter value encoding adheres to the filter select
+                    # type.
+                    for filter_config in filter_configs:
+                        if filter_config["column"] == col:
+                            is_multiple = filter_config["multiple"]
+
+                            if not is_multiple and isinstance(val, list):
+                                val = val[0]
+                            elif is_multiple and not isinstance(val, list):
+                                val = [val]
+                            break
+
+                    extra_filters.append(
+                        {
+                            "col": col,
+                            "op": "in" if isinstance(val, list) else "==",
+                            "val": val,
+                        }
+                    )
+
+    return extra_filters
+
+
+def is_slice_in_container(
+    layout: dict[str, dict[str, Any]], container_id: str, slice_id: int
+) -> bool:
+    if container_id == "ROOT_ID":
+        return True
+
+    node = layout[container_id]
+    node_type = node.get("type")
+    if node_type == "CHART" and node.get("meta", {}).get("chartId") == slice_id:
+        return True
+
+    if node_type in CONTAINER_TYPES:
+        children = node.get("children", [])
+        return any(
+            is_slice_in_container(layout, child_id, slice_id) for child_id in children
+        )
+
+    return False
+
+
+def check_resource_permissions(
+    check_perms: Callable[..., Any],
+) -> Callable[..., Any]:
+    """
+    A decorator for checking permissions on a request using the passed-in function.
+    """
+
+    def decorator(f: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(f)
+        def wrapper(*args: Any, **kwargs: Any) -> None:
+            # check if the user can access the resource
+            check_perms(*args, **kwargs)
+            return f(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def _deserialize_results_payload(
+    payload: Union[bytes, str], query: Query, use_msgpack: Optional[bool] = False
+) -> dict[str, Any]:
+    logger.debug("Deserializing from msgpack: %r", use_msgpack)
+    if use_msgpack:
+        with stats_timing(
+            "sqllab.query.results_backend_msgpack_deserialize", stats_logger
+        ):
+            ds_payload = msgpack.loads(payload, raw=False)
+
+        with stats_timing("sqllab.query.results_backend_pa_deserialize", stats_logger):
+            try:
+                reader = pa.BufferReader(ds_payload["data"])
+                pa_table = pa.ipc.open_stream(reader).read_all()
+            except pa.ArrowSerializationError as ex:
+                raise SerializationError("Unable to deserialize table") from ex
+
+        df = result_set.SupersetResultSet.convert_table_to_df(pa_table)
+        ds_payload["data"] = dataframe.df_to_records(df) or []
+
+        for column in ds_payload["selected_columns"]:
+            if "name" in column:
+                column["column_name"] = column.get("name")
+
+        db_engine_spec = query.database.db_engine_spec
+        all_columns, data, expanded_columns = db_engine_spec.expand_data(
+            ds_payload["selected_columns"], ds_payload["data"]
+        )
+        ds_payload.update(
+            {"data": data, "columns": all_columns, "expanded_columns": expanded_columns}
+        )
+
+        return ds_payload
+
+    with stats_timing("sqllab.query.results_backend_json_deserialize", stats_logger):
+        return json.loads(payload)
+
+
+def get_cta_schema_name(
+    database: Database, user: ab_models.User, schema: str, sql: str
+) -> Optional[str]:
+    func: Optional[Callable[[Database, ab_models.User, str, str], str]] = app.config[
+        "SQLLAB_CTAS_SCHEMA_NAME_FUNC"
+    ]
+    if not func:
+        return None
+    return func(database, user, schema, sql)

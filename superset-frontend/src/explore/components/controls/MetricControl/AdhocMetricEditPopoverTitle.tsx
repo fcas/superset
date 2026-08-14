@@ -1,0 +1,145 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import {
+  ChangeEventHandler,
+  FocusEvent,
+  KeyboardEvent,
+  useCallback,
+  useState,
+  FC,
+} from 'react';
+
+import { t } from '@apache-superset/core/translation';
+import { css, styled, useTheme } from '@apache-superset/core/theme';
+import { Input, Tooltip } from '@superset-ui/core/components';
+import { Icons } from '@superset-ui/core/components/Icons';
+
+const TitleLabel = styled.span`
+  display: inline-block;
+  padding: 2px 0;
+`;
+
+const StyledInput = styled(Input)`
+  border-radius: ${({ theme }) => theme.borderRadius};
+  height: 26px;
+  padding-left: ${({ theme }) => theme.sizeUnit * 2.5}px;
+`;
+
+export interface AdhocMetricEditPopoverTitleProps {
+  title?: {
+    label?: string;
+    hasCustomLabel?: boolean;
+  };
+  isEditDisabled?: boolean;
+  onChange: ChangeEventHandler<HTMLInputElement>;
+}
+
+const AdhocMetricEditPopoverTitle: FC<AdhocMetricEditPopoverTitleProps> = ({
+  title,
+  isEditDisabled,
+  onChange,
+}) => {
+  const theme = useTheme();
+  const [isHovered, setIsHovered] = useState(false);
+  const [isEditMode, setIsEditMode] = useState(false);
+
+  const defaultLabel = t('My metric');
+
+  const handleMouseOver = useCallback(() => setIsHovered(true), []);
+  const handleMouseOut = useCallback(() => setIsHovered(false), []);
+  const handleClick = useCallback(() => setIsEditMode(true), []);
+  const handleBlur = useCallback(() => {
+    setIsHovered(false);
+    setIsEditMode(false);
+  }, []);
+
+  const handleKeyPress = useCallback(
+    (ev: KeyboardEvent<HTMLInputElement>) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        handleBlur();
+      }
+    },
+    [handleBlur],
+  );
+
+  const handleInputBlur = useCallback(
+    (e: FocusEvent<HTMLInputElement>) => {
+      if (e.target.value === '') {
+        onChange(e);
+      }
+
+      handleBlur();
+    },
+    [onChange, handleBlur],
+  );
+
+  if (isEditDisabled) {
+    return (
+      <span data-test="AdhocMetricTitle">{title?.label || defaultLabel}</span>
+    );
+  }
+
+  if (isEditMode) {
+    return (
+      <StyledInput
+        type="text"
+        placeholder={title?.label}
+        value={title?.hasCustomLabel ? title.label : ''}
+        autoFocus
+        onChange={onChange}
+        onBlur={handleInputBlur}
+        onKeyPress={handleKeyPress}
+        data-test="AdhocMetricEditTitle#input"
+      />
+    );
+  }
+
+  return (
+    <Tooltip placement="top" title={t('Click to edit label')}>
+      <button
+        type="button"
+        css={css`
+          appearance: none;
+          border: none;
+          background: none;
+          padding: 0;
+          font: inherit;
+          cursor: pointer;
+        `}
+        className="AdhocMetricEditPopoverTitle inline-editable"
+        data-test="AdhocMetricEditTitle#trigger"
+        onMouseOver={handleMouseOver}
+        onMouseOut={handleMouseOut}
+        onFocus={handleMouseOver}
+        onClick={handleClick}
+        onBlur={handleBlur}
+      >
+        <TitleLabel>{title?.label || defaultLabel}</TitleLabel>
+        &nbsp;
+        <Icons.EditOutlined
+          iconColor={isHovered ? theme.colorPrimary : theme.colorIcon}
+          iconSize="m"
+        />
+      </button>
+    </Tooltip>
+  );
+};
+
+export default AdhocMetricEditPopoverTitle;

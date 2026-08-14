@@ -1,0 +1,323 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+from random import randint
+from unittest.mock import MagicMock, patch
+
+import pytest
+from freezegun import freeze_time
+from freezegun.api import FakeDatetime
+
+from superset.extensions import db
+from superset.reports.models import ReportSchedule, ReportScheduleType
+from superset.subjects.models import Subject
+from superset.subjects.types import SubjectType
+from superset.tasks.scheduler import execute, log_task_failure, scheduler
+from tests.integration_tests.reports.utils import insert_report_schedule
+from tests.integration_tests.test_app import app
+
+
+@pytest.fixture
+def editors(get_user) -> list[Subject]:
+    admin = get_user("admin")
+    return list(
+        db.session.query(Subject)
+        .filter_by(user_id=admin.id, type=SubjectType.USER)
+        .all()
+    )
+
+
+@pytest.mark.usefixtures("app_context")
+@patch("superset.tasks.scheduler.execute.apply_async")
+def test_scheduler_celery_timeout_ny(execute_mock, editors):
+    """
+    Reports scheduler: Test scheduler setting celery soft and hard timeout
+    """
+    report_schedule = insert_report_schedule(
+        type=ReportScheduleType.ALERT,
+        name="report",
+        crontab="0 4 * * *",
+        timezone="America/New_York",
+        editors=editors,
+    )
+
+    with freeze_time("2020-01-01T09:00:00Z"):
+        scheduler()
+        assert execute_mock.call_args[1]["soft_time_limit"] == 3601
+        assert execute_mock.call_args[1]["time_limit"] == 3610
+    db.session.delete(report_schedule)
+    db.session.commit()
+
+
+@pytest.mark.usefixtures("app_context")
+@patch("superset.tasks.scheduler.execute.apply_async")
+def test_scheduler_celery_no_timeout_ny(execute_mock, editors):
+    """
+    Reports scheduler: Test scheduler setting celery soft and hard timeout
+    """
+    app.config["ALERT_REPORTS_WORKING_TIME_OUT_KILL"] = False
+    report_schedule = insert_report_schedule(
+        type=ReportScheduleType.ALERT,
+        name="report",
+        crontab="0 4 * * *",
+        timezone="America/New_York",
+        editors=editors,
+    )
+
+    with freeze_time("2020-01-01T09:00:00Z"):
+        scheduler()
+        assert execute_mock.call_args[1] == {"eta": FakeDatetime(2020, 1, 1, 9, 0)}
+    db.session.delete(report_schedule)
+    db.session.commit()
+    app.config["ALERT_REPORTS_WORKING_TIME_OUT_KILL"] = True
+
+
+@pytest.mark.usefixtures("app_context")
+@patch("superset.tasks.scheduler.execute.apply_async")
+def test_scheduler_celery_timeout_utc(execute_mock, editors):
+    """
+    Reports scheduler: Test scheduler setting celery soft and hard timeout
+    """
+    report_schedule = insert_report_schedule(
+        type=ReportScheduleType.ALERT,
+        name="report",
+        crontab="0 9 * * *",
+        timezone="UTC",
+        editors=editors,
+    )
+
+    with freeze_time("2020-01-01T09:00:00Z"):
+        scheduler()
+        assert execute_mock.call_args[1]["soft_time_limit"] == 3601
+        assert execute_mock.call_args[1]["time_limit"] == 3610
+    db.session.delete(report_schedule)
+    db.session.commit()
+
+
+@pytest.mark.usefixtures("app_context")
+@patch("superset.tasks.scheduler.execute.apply_async")
+def test_scheduler_report_timeout_uses_end_to_end_budget(execute_mock, editors):
+    report_schedule = insert_report_schedule(
+        type=ReportScheduleType.REPORT,
+        name="dashboard report",
+        crontab="0 9 * * *",
+        timezone="UTC",
+        editors=editors,
+    )
+
+    # The default budget (1h) matches the working_timeout column default, so
+    # the derived limits preserve the historical runtime ceiling out of the box.
+    with freeze_time("2020-01-01T09:00:00Z"):
+        scheduler()
+        assert execute_mock.call_args[1]["soft_time_limit"] == 3600
+        assert execute_mock.call_args[1]["time_limit"] == 3630
+
+    # A lower per-schedule working_timeout caps the effective budget and the
+    # derived Celery limits. Update via query so persistence does not depend
+    # on which session the fixture object is bound to.
+    db.session.query(ReportSchedule).filter(
+        ReportSchedule.id == report_schedule.id
+    ).update({"working_timeout": 900})
+    db.session.commit()
+    with freeze_time("2020-01-01T09:00:00Z"):
+        scheduler()
+        assert execute_mock.call_args[1]["soft_time_limit"] == 900
+        assert execute_mock.call_args[1]["time_limit"] == 930
+
+    db.session.delete(report_schedule)
+    db.session.commit()
+
+
+@pytest.mark.usefixtures("app_context")
+@patch("superset.tasks.scheduler.execute.apply_async")
+def test_scheduler_celery_no_timeout_utc(execute_mock, editors):
+    """
+    Reports scheduler: Test scheduler setting celery soft and hard timeout
+    """
+    app.config["ALERT_REPORTS_WORKING_TIME_OUT_KILL"] = False
+    report_schedule = insert_report_schedule(
+        type=ReportScheduleType.ALERT,
+        name="report",
+        crontab="0 9 * * *",
+        timezone="UTC",
+        editors=editors,
+    )
+
+    with freeze_time("2020-01-01T09:00:00Z"):
+        scheduler()
+        assert execute_mock.call_args[1] == {"eta": FakeDatetime(2020, 1, 1, 9, 0)}
+    db.session.delete(report_schedule)
+    db.session.commit()
+    app.config["ALERT_REPORTS_WORKING_TIME_OUT_KILL"] = True
+
+
+@pytest.mark.usefixtures("app_context")
+@patch("superset.tasks.scheduler.is_feature_enabled")
+@patch("superset.tasks.scheduler.execute.apply_async")
+def test_scheduler_feature_flag_off(execute_mock, is_feature_enabled, editors):
+    """
+    Reports scheduler: Test scheduler with feature flag off
+    """
+    is_feature_enabled.return_value = False
+    report_schedule = insert_report_schedule(
+        type=ReportScheduleType.ALERT,
+        name="report",
+        crontab="0 9 * * *",
+        timezone="UTC",
+        editors=editors,
+    )
+
+    with freeze_time("2020-01-01T09:00:00Z"):
+        scheduler()
+        execute_mock.assert_not_called()
+    db.session.delete(report_schedule)
+    db.session.commit()
+
+
+@pytest.mark.usefixtures("app_context")
+@patch("superset.commands.report.execute.AsyncExecuteReportScheduleCommand.__init__")
+@patch("superset.commands.report.execute.AsyncExecuteReportScheduleCommand.run")
+@patch("superset.tasks.scheduler.execute.update_state")
+def test_execute_task(update_state_mock, command_mock, init_mock, editors):
+    from superset.commands.report.exceptions import ReportScheduleUnexpectedError
+
+    report_schedule = insert_report_schedule(
+        type=ReportScheduleType.ALERT,
+        name=f"report-{randint(0, 1000)}",  # noqa: S311
+        crontab="0 4 * * *",
+        timezone="America/New_York",
+        editors=editors,
+    )
+    init_mock.return_value = None
+    command_mock.side_effect = ReportScheduleUnexpectedError("Unexpected error")
+    with freeze_time("2020-01-01T09:00:00Z"):
+        execute(report_schedule.id)
+        update_state_mock.assert_called_with(state="FAILURE")
+
+    db.session.delete(report_schedule)
+    db.session.commit()
+
+
+@pytest.mark.usefixtures("app_context")
+@patch("superset.commands.report.execute.AsyncExecuteReportScheduleCommand.__init__")
+@patch("superset.commands.report.execute.AsyncExecuteReportScheduleCommand.run")
+@patch("superset.tasks.scheduler.execute.update_state")
+def test_execute_soft_timeout_emits_operator_metric(
+    update_state_mock,
+    command_mock,
+    init_mock,
+    editors,
+):
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    report_schedule = insert_report_schedule(
+        type=ReportScheduleType.REPORT,
+        name=f"report-{randint(0, 1000)}",  # noqa: S311
+        crontab="0 4 * * *",
+        timezone="America/New_York",
+        editors=editors,
+    )
+    stats_logger = MagicMock()
+    init_mock.return_value = None
+    command_mock.side_effect = SoftTimeLimitExceeded()
+
+    with (
+        patch.dict(app.config, {"STATS_LOGGER": stats_logger}),
+        pytest.raises(SoftTimeLimitExceeded),
+    ):
+        execute(report_schedule.id)
+
+    stats_logger.incr.assert_any_call("reports.execute.celery_soft_timeout")
+    update_state_mock.assert_called_once_with(state="FAILURE")
+    db.session.delete(report_schedule)
+    db.session.commit()
+
+
+@pytest.mark.usefixtures("app_context")
+@patch("superset.commands.report.execute.AsyncExecuteReportScheduleCommand.__init__")
+@patch("superset.commands.report.execute.AsyncExecuteReportScheduleCommand.run")
+@patch("superset.tasks.scheduler.execute.update_state")
+@patch("superset.utils.log.logger")
+def test_execute_task_with_command_exception(
+    logger_mock, update_state_mock, command_mock, init_mock, editors
+):
+    from superset.commands.exceptions import CommandException
+
+    report_schedule = insert_report_schedule(
+        type=ReportScheduleType.ALERT,
+        name=f"report-{randint(0, 1000)}",  # noqa: S311
+        crontab="0 4 * * *",
+        timezone="America/New_York",
+        editors=editors,
+    )
+    init_mock.return_value = None
+    command_mock.side_effect = CommandException("Unexpected error")
+    with freeze_time("2020-01-01T09:00:00Z"):
+        execute(report_schedule.id)
+        update_state_mock.assert_called_with(state="FAILURE")
+        logger_mock.exception.assert_called_with(
+            "A downstream exception occurred while generating a report: None. Unexpected error",  # noqa: E501
+            exc_info=True,
+        )
+
+    db.session.delete(report_schedule)
+    db.session.commit()
+
+
+@patch("superset.tasks.scheduler.logger")
+def test_log_task_failure_with_sender(logger_mock):
+    """
+    Test that log_task_failure logs correctly when sender is provided
+    """
+    mock_task = MagicMock()
+    mock_task.name = "test.task.name"
+    mock_exception = Exception("Test error")
+    mock_einfo = MagicMock()
+
+    log_task_failure(
+        sender=mock_task,
+        task_id="test-task-id",
+        exception=mock_exception,
+        einfo=mock_einfo,
+    )
+
+    logger_mock.exception.assert_called_once_with(
+        "Celery task %s failed: %s",
+        "test.task.name",
+        mock_exception,
+        exc_info=mock_einfo,
+    )
+
+
+@patch("superset.tasks.scheduler.logger")
+def test_log_task_failure_without_sender(logger_mock):
+    """
+    Test that log_task_failure logs correctly when sender is None
+    """
+    mock_exception = Exception("Test error")
+    mock_einfo = MagicMock()
+
+    log_task_failure(
+        sender=None,
+        task_id="test-task-id",
+        exception=mock_exception,
+        einfo=mock_einfo,
+    )
+
+    logger_mock.exception.assert_called_once_with(
+        "Celery task %s failed: %s", "Unknown", mock_exception, exc_info=mock_einfo
+    )

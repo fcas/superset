@@ -1,0 +1,316 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import fetchMock from 'fetch-mock';
+import rison from 'rison';
+import {
+  act,
+  render,
+  screen,
+  selectPillOption,
+  waitFor,
+  within,
+} from 'spec/helpers/testing-library';
+import { MemoryRouter } from 'react-router-dom';
+import { QueryParamProvider } from 'use-query-params';
+import { ReactRouter5Adapter } from 'use-query-params/adapters/react-router-5';
+import userEvent from '@testing-library/user-event';
+import RowLevelSecurityList from '.';
+
+const ruleListEndpoint = 'glob:*/api/v1/rowlevelsecurity/?*';
+const ruleInfoEndpoint = 'glob:*/api/v1/rowlevelsecurity/_info*';
+const relatedSubjectsEndpoint =
+  'glob:*/api/v1/rowlevelsecurity/related/subjects*';
+
+const mockRules = [
+  {
+    changed_on_delta_humanized: '1 days ago',
+    clause: '1=1',
+    description: 'some description',
+    filter_type: 'Regular',
+    group_key: 'group-1',
+    id: 1,
+    name: 'rule 1',
+    roles: [
+      {
+        id: 3,
+        name: 'Alpha',
+      },
+      {
+        id: 5,
+        name: 'Gamma',
+      },
+    ],
+    subjects: [
+      {
+        id: 10,
+        label: 'Alpha',
+        type: 2,
+      },
+      {
+        id: 11,
+        label: 'Gamma',
+        type: 2,
+      },
+    ],
+    tables: [
+      {
+        id: 6,
+        table_name: 'flights',
+      },
+      {
+        id: 13,
+        table_name: 'messages',
+      },
+    ],
+  },
+  {
+    changed_on_delta_humanized: '2 days ago',
+    clause: '2=2',
+    description: 'some description 2',
+    filter_type: 'Base',
+    group_key: 'group-1',
+    id: 2,
+    name: 'rule 2',
+    roles: [
+      {
+        id: 3,
+        name: 'Alpha',
+      },
+      {
+        id: 5,
+        name: 'Gamma',
+      },
+    ],
+    subjects: [
+      {
+        id: 10,
+        label: 'Alpha',
+        type: 2,
+      },
+      {
+        id: 11,
+        label: 'Gamma',
+        type: 2,
+      },
+    ],
+    tables: [
+      {
+        id: 6,
+        table_name: 'flights',
+      },
+      {
+        id: 13,
+        table_name: 'messages',
+      },
+    ],
+  },
+];
+fetchMock.get(
+  ruleListEndpoint,
+  { result: mockRules, count: 2 },
+  { name: ruleListEndpoint },
+);
+fetchMock.get(
+  ruleInfoEndpoint,
+  { permissions: ['can_read', 'can_write'] },
+  { name: ruleInfoEndpoint },
+);
+fetchMock.get(
+  relatedSubjectsEndpoint,
+  { result: [{ value: 10, text: 'Alpha', extra: { type: 2 } }], count: 1 },
+  { name: relatedSubjectsEndpoint },
+);
+global.URL.createObjectURL = jest.fn();
+
+const mockUser = {
+  userId: 1,
+};
+
+function getLatestRuleApiCall() {
+  const calls = fetchMock.callHistory.calls(/rowlevelsecurity\/\?q/);
+  const latest = calls[calls.length - 1];
+  const queryString = latest
+    ? new URL(latest.url).searchParams.get('q')
+    : undefined;
+  return queryString
+    ? {
+        call: latest,
+        query: rison.decode(queryString) as { filters?: unknown[] },
+      }
+    : null;
+}
+
+// eslint-disable-next-line no-restricted-globals -- TODO: Migrate from describe blocks
+describe('RuleList RTL', () => {
+  async function renderAndWait() {
+    const mounted = act(async () => {
+      const mockedProps = {};
+      render(
+        <MemoryRouter>
+          <QueryParamProvider adapter={ReactRouter5Adapter}>
+            <RowLevelSecurityList {...mockedProps} user={mockUser} />
+          </QueryParamProvider>
+        </MemoryRouter>,
+        { useRedux: true },
+      );
+    });
+    return mounted;
+  }
+
+  test('renders', async () => {
+    await renderAndWait();
+    expect(screen.getByText('Row Level Security')).toBeVisible();
+  });
+
+  test('renders a ListView', async () => {
+    await renderAndWait();
+    expect(screen.getByTestId('rls-list-view')).toBeInTheDocument();
+  });
+
+  test('fetched data', async () => {
+    fetchMock.clearHistory();
+    await renderAndWait();
+    const apiCalls = fetchMock.callHistory.calls(/rowlevelsecurity\/\?q/);
+    expect(apiCalls).toHaveLength(1);
+    expect(apiCalls[0].url).toMatchInlineSnapshot(
+      `"http://localhost/api/v1/rowlevelsecurity/?q=(order_column:changed_on_delta_humanized,order_direction:desc,page:0,page_size:25)"`,
+    );
+    fetchMock.clearHistory();
+  });
+
+  test('renders add rule button on empty state', async () => {
+    fetchMock.modifyRoute(ruleListEndpoint, {
+      response: { result: [], count: 0 },
+    });
+    await renderAndWait();
+
+    const emptyAddRuleButton = await screen.findByTestId('add-rule-empty');
+    expect(emptyAddRuleButton).toBeInTheDocument();
+    fetchMock.modifyRoute(ruleListEndpoint, {
+      response: { result: mockRules, count: 2 },
+    });
+  });
+
+  test('renders a "Rule" button to add a rule in bulk action', async () => {
+    await renderAndWait();
+
+    const addRuleButton = await screen.findByTestId('add-rule');
+    const emptyAddRuleButton = screen.queryByTestId('add-rule-empty');
+    expect(addRuleButton).toBeInTheDocument();
+    expect(emptyAddRuleButton).not.toBeInTheDocument();
+  });
+
+  test('renders filter options', async () => {
+    await renderAndWait();
+
+    // Compact filter UI: only the first search filter renders (Name),
+    // subsequent search filters (Group Key) are hidden — one search box per page.
+    const searchFilters = screen.queryAllByTestId('filters-search');
+    expect(searchFilters).toHaveLength(1);
+
+    // Select filters render as compact pill buttons (Filter Type, Subject, Modified by)
+    const selectContainers = screen.queryAllByTestId('select-filter-container');
+    expect(selectContainers).toHaveLength(3);
+  });
+
+  test('selecting Subject filter encodes rel_m_m subjects in API call', async () => {
+    await renderAndWait();
+    await screen.findByTestId('rls-list-view');
+
+    await selectPillOption('Alpha', 'Subject');
+
+    await waitFor(() => {
+      const latest = getLatestRuleApiCall();
+      expect(latest).not.toBeNull();
+      expect(latest!.query.filters).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            col: 'subjects',
+            opr: 'rel_m_m',
+            value: 10,
+          }),
+        ]),
+      );
+    });
+  });
+
+  test('renders correct list columns', async () => {
+    await renderAndWait();
+
+    const table = screen.getByRole('table');
+    expect(table).toBeInTheDocument();
+
+    const nameColumn = await within(table).findByTitle('Name');
+    const filterTypeColumn = await within(table).findByTitle('Filter Type');
+    const subjectsColumn = await within(table).findByTitle('Subjects');
+    const groupKeyColumn = await within(table).findByTitle('Group Key');
+    const clauseColumn = await within(table).findByTitle('Clause');
+    const modifiedColumn = await within(table).findByTitle('Last modified');
+    const actionsColumn = await within(table).findByTitle('Actions');
+
+    expect(nameColumn).toBeInTheDocument();
+    expect(filterTypeColumn).toBeInTheDocument();
+    expect(subjectsColumn).toBeInTheDocument();
+    expect(groupKeyColumn).toBeInTheDocument();
+    expect(clauseColumn).toBeInTheDocument();
+    expect(modifiedColumn).toBeInTheDocument();
+    expect(actionsColumn).toBeInTheDocument();
+  });
+
+  test('renders correct action buttons with write permission', async () => {
+    await renderAndWait();
+
+    const deleteActionIcon = screen.queryAllByTestId('rls-list-trash-icon');
+    expect(deleteActionIcon).toHaveLength(2);
+
+    const editActionIcon = screen.queryAllByTestId('edit-alt');
+    expect(editActionIcon).toHaveLength(2);
+  });
+
+  test('should not renders correct action buttons without write permission', async () => {
+    fetchMock.modifyRoute(ruleInfoEndpoint, {
+      response: { permissions: ['can_read'] },
+    });
+
+    await renderAndWait();
+
+    const deleteActionIcon = screen.queryByTestId('rls-list-trash-icon');
+    expect(deleteActionIcon).not.toBeInTheDocument();
+
+    const editActionIcon = screen.queryByTestId('edit-alt');
+    expect(editActionIcon).not.toBeInTheDocument();
+
+    fetchMock.modifyRoute(ruleInfoEndpoint, {
+      response: { permissions: ['can_read', 'can_write'] },
+    });
+  });
+
+  test('renders popover on new clicking rule button', async () => {
+    await renderAndWait();
+
+    const modal = screen.queryByTestId('rls-modal-title');
+    expect(modal).not.toBeInTheDocument();
+
+    const addRuleButton = await screen.findByTestId('add-rule');
+    userEvent.click(addRuleButton);
+
+    const modalAfterClick = screen.queryByTestId('rls-modal-title');
+    expect(modalAfterClick).toBeInTheDocument();
+  });
+});

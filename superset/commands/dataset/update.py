@@ -1,0 +1,483 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import logging
+from collections import Counter
+from functools import partial
+from typing import Any, cast, Optional
+from uuid import UUID
+
+from flask_appbuilder.models.sqla import Model
+from marshmallow import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
+
+from superset import is_feature_enabled, security_manager
+from superset.commands.base import BaseCommand, UpdateMixin
+from superset.commands.dataset.exceptions import (
+    DatabaseNotFoundValidationError,
+    DatasetColumnNotFoundValidationError,
+    DatasetColumnsDuplicateValidationError,
+    DatasetColumnsExistsValidationError,
+    DatasetDataAccessIsNotAllowed,
+    DatasetExistsValidationError,
+    DatasetForbiddenError,
+    DatasetInvalidError,
+    DatasetMetricsDuplicateValidationError,
+    DatasetMetricsExistsValidationError,
+    DatasetMetricsNotFoundValidationError,
+    DatasetNotFoundError,
+    DatasetUpdateFailedError,
+    MultiCatalogDisabledValidationError,
+)
+from superset.commands.utils import compute_subjects
+from superset.connectors.sqla.models import SqlaTable, validate_stored_expression
+from superset.daos.dataset import DatasetDAO
+from superset.datasets.schemas import FolderSchema
+from superset.exceptions import (
+    QueryClauseValidationException,
+    SupersetParseError,
+    SupersetSecurityException,
+)
+from superset.models.core import Database
+from superset.sql.parse import Table
+from superset.utils.decorators import on_error, transaction
+
+logger = logging.getLogger(__name__)
+
+# Default folder UUIDs matching the frontend constants.
+# Stored as strings so comparisons work whether obj["uuid"] is str or UUID.
+DEFAULT_METRICS_FOLDER_UUID = "255b537d-58c8-443d-9fc1-4e4dc75047e2"
+DEFAULT_COLUMNS_FOLDER_UUID = "83a7ae8f-2e8a-4f2b-a8cb-ebaebef95b9b"
+DEFAULT_FOLDER_UUIDS = frozenset(
+    {DEFAULT_METRICS_FOLDER_UUID, DEFAULT_COLUMNS_FOLDER_UUID}
+)
+
+
+class UpdateDatasetCommand(UpdateMixin, BaseCommand):
+    def __init__(
+        self,
+        model_id: int,
+        data: dict[str, Any],
+        override_columns: Optional[bool] = False,
+    ):
+        self._model_id = model_id
+        self._properties = data.copy()
+        self._model: Optional[SqlaTable] = None
+        self.override_columns = override_columns
+        self._properties["override_columns"] = override_columns
+
+    @transaction(
+        on_error=partial(
+            on_error,
+            catches=(
+                SQLAlchemyError,
+                ValueError,
+            ),
+            reraise=DatasetUpdateFailedError,
+        )
+    )
+    def run(self) -> Model:
+        self.validate()
+        assert self._model
+        return DatasetDAO.update(self._model, attributes=self._properties)
+
+    def validate(self) -> None:
+        exceptions: list[ValidationError] = []
+
+        # Validate/populate model exists
+        self._model = DatasetDAO.find_by_id(self._model_id)
+        if not self._model:
+            raise DatasetNotFoundError()
+
+        # Check permission to update the dataset
+        try:
+            security_manager.raise_for_editorship(self._model)
+        except SupersetSecurityException as ex:
+            raise DatasetForbiddenError() from ex
+
+        # Validate/Populate editors
+        compute_subjects(self._model, self._properties, exceptions)
+
+        self._validate_dataset_source(exceptions)
+        self._validate_semantics(exceptions)
+
+        if exceptions:
+            raise DatasetInvalidError(exceptions=exceptions)
+
+    def _validate_dataset_source(self, exceptions: list[ValidationError]) -> None:
+        # we know we have a valid model
+        self._model = cast(SqlaTable, self._model)
+        database_id = self._properties.pop("database_id", None)
+        new_db_connection = self._get_new_database_connection(database_id, exceptions)
+        db = new_db_connection or self._model.database
+        database_changed = new_db_connection is not None
+
+        # Detect a caller-supplied change to the source binding, inspected
+        # before the catalog normalization below injects derived values.
+        source_changed = database_changed or any(
+            field in self._properties
+            and self._properties[field] != getattr(self._model, field)
+            for field in ("catalog", "schema", "table_name")
+        )
+
+        catalog, schema, table = self._resolve_catalog_schema_table(db, exceptions)
+
+        # Repointing to a different database connection requires access to
+        # that connection, independent of the caller's editorship of this
+        # dataset -- only persist the change once that's confirmed.
+        if new_db_connection:
+            self._apply_database_repoint(new_db_connection, table, exceptions)
+
+        # Validate uniqueness
+        if not DatasetDAO.validate_update_uniqueness(
+            db,
+            table,
+            self._model_id,
+        ):
+            exceptions.append(DatasetExistsValidationError(table))
+
+        # Repointing a physical dataset (or converting a virtual dataset to a
+        # physical one) runs the same data-access check as the create path.
+        # Skip it when the database connection itself changed: that case is
+        # already covered by the repoint check above, against the same
+        # (db, table) pair.
+        sql = self._properties.get("sql", self._model.sql)
+        if (
+            not new_db_connection
+            and not sql
+            and (source_changed or ("sql" in self._properties and self._model.sql))
+        ):
+            self._validate_table_access(db, table, exceptions)
+
+        self._validate_sql_access(db, catalog, schema, exceptions)
+
+    def _get_new_database_connection(
+        self, database_id: int | None, exceptions: list[ValidationError]
+    ) -> Database | None:
+        # we know we have a valid model
+        self._model = cast(SqlaTable, self._model)
+        if database_id and database_id != self._model.database.id:
+            if new_db_connection := DatasetDAO.get_database_by_id(database_id):
+                return new_db_connection
+            exceptions.append(DatabaseNotFoundValidationError())
+        return None
+
+    def _resolve_catalog_schema_table(
+        self, db: Database, exceptions: list[ValidationError]
+    ) -> tuple[str | None, str | None, Table]:
+        # we know we have a valid model
+        self._model = cast(SqlaTable, self._model)
+        catalog = self._properties.get("catalog")
+        default_catalog = db.get_default_catalog()
+
+        # If multi-catalog is disabled, and catalog provided is not
+        # the default one, fail
+        if (
+            "catalog" in self._properties
+            and catalog != default_catalog
+            and not db.allow_multi_catalog
+        ):
+            exceptions.append(MultiCatalogDisabledValidationError())
+
+        # If the DB connection does not support multi-catalog,
+        # use the default catalog
+        elif not db.allow_multi_catalog:
+            catalog = self._properties["catalog"] = default_catalog
+
+        # Fallback to using the previous value if not provided
+        elif "catalog" not in self._properties:
+            catalog = self._model.catalog
+
+        schema = (
+            self._properties["schema"]
+            if "schema" in self._properties
+            else self._model.schema
+        )
+
+        table = Table(
+            self._properties.get("table_name", self._model.table_name),
+            schema,
+            catalog,
+        )
+        return catalog, schema, table
+
+    def _apply_database_repoint(
+        self,
+        new_db_connection: Database,
+        table: Table,
+        exceptions: list[ValidationError],
+    ) -> None:
+        try:
+            security_manager.raise_for_access(database=new_db_connection, table=table)
+        except SupersetSecurityException as ex:
+            exceptions.append(DatasetDataAccessIsNotAllowed(ex.error.message))
+        else:
+            self._properties["database"] = new_db_connection
+
+    def _validate_table_access(
+        self, db: Database, table: Table, exceptions: list[ValidationError]
+    ) -> None:
+        try:
+            security_manager.raise_for_access(database=db, table=table)
+        except SupersetSecurityException as ex:
+            exceptions.append(DatasetDataAccessIsNotAllowed(ex.error.message))
+
+    def _validate_sql_access(
+        self,
+        db: Database,
+        catalog: str | None,
+        schema: str | None,
+        exceptions: list[ValidationError],
+    ) -> None:
+        """Validate SQL query access if SQL is being updated."""
+        # we know we have a valid model
+        self._model = cast(SqlaTable, self._model)
+
+        sql = self._properties.get("sql")
+        if sql and sql != self._model.sql:
+            try:
+                security_manager.raise_for_access(
+                    database=db,
+                    sql=sql,
+                    catalog=catalog,
+                    schema=schema,
+                )
+            except SupersetSecurityException as ex:
+                exceptions.append(DatasetDataAccessIsNotAllowed(ex.error.message))
+            except SupersetParseError as ex:
+                exceptions.append(
+                    ValidationError(
+                        f"Invalid SQL: {ex.error.message}",
+                        field_name="sql",
+                    )
+                )
+
+    def _validate_semantics(self, exceptions: list[ValidationError]) -> None:
+        # we know we have a valid model
+        self._model = cast(SqlaTable, self._model)
+        if columns := self._properties.get("columns"):
+            self._validate_columns(columns, exceptions)
+            self._validate_expressions(columns, "columns", exceptions)
+
+        if metrics := self._properties.get("metrics"):
+            self._validate_metrics(metrics, exceptions)
+            self._validate_expressions(metrics, "metrics", exceptions)
+
+        if predicate := self._properties.get("fetch_values_predicate"):
+            self._validate_fetch_values_predicate(predicate, exceptions)
+
+        if folders := self._properties.get("folders"):
+            valid_uuids: set[UUID] = set()
+            if metrics:
+                valid_uuids.update(
+                    metric["uuid"] for metric in metrics if "uuid" in metric
+                )
+            else:
+                valid_uuids.update(metric.uuid for metric in self._model.metrics)
+
+            if columns:
+                valid_uuids.update(
+                    column["uuid"] for column in columns if "uuid" in column
+                )
+            else:
+                valid_uuids.update(column.uuid for column in self._model.columns)
+
+            schema = FolderSchema(many=True)
+            try:
+                loaded_folders = schema.load(folders)
+                validate_folders(loaded_folders, valid_uuids)
+                self._properties["folders"] = schema.dump(loaded_folders)
+            except ValidationError as ex:
+                exceptions.append(ex)
+
+    def _validate_columns(
+        self, columns: list[dict[str, Any]], exceptions: list[ValidationError]
+    ) -> None:
+        # Validate duplicates on data
+        if self._get_duplicates(columns, "column_name"):
+            exceptions.append(DatasetColumnsDuplicateValidationError())
+        else:
+            # validate invalid id's
+            columns_ids: list[int] = [
+                column["id"] for column in columns if "id" in column
+            ]
+            if not DatasetDAO.validate_columns_exist(self._model_id, columns_ids):
+                exceptions.append(DatasetColumnNotFoundValidationError())
+
+            # validate new column names uniqueness
+            if not self.override_columns:
+                columns_names: list[str] = [
+                    column["column_name"] for column in columns if "id" not in column
+                ]
+                if not DatasetDAO.validate_columns_uniqueness(
+                    self._model_id, columns_names
+                ):
+                    exceptions.append(DatasetColumnsExistsValidationError())
+
+    def _validate_metrics(
+        self, metrics: list[dict[str, Any]], exceptions: list[ValidationError]
+    ) -> None:
+        if self._get_duplicates(metrics, "metric_name"):
+            exceptions.append(DatasetMetricsDuplicateValidationError())
+        else:
+            # validate invalid id's
+            metrics_ids: list[int] = [
+                metric["id"] for metric in metrics if "id" in metric
+            ]
+            if not DatasetDAO.validate_metrics_exist(self._model_id, metrics_ids):
+                exceptions.append(DatasetMetricsNotFoundValidationError())
+            # validate new metric names uniqueness
+            metric_names: list[str] = [
+                metric["metric_name"] for metric in metrics if "id" not in metric
+            ]
+            if not DatasetDAO.validate_metrics_uniqueness(self._model_id, metric_names):
+                exceptions.append(DatasetMetricsExistsValidationError())
+
+    def _validate_expressions(
+        self,
+        items: list[dict[str, Any]],
+        label: str,
+        exceptions: list[ValidationError],
+    ) -> None:
+        """
+        Run each item's SQL expression through the parser-based validator that
+        already governs adhoc expressions, so stored column and metric
+        expressions cannot smuggle sub-queries, set operations, or
+        multi-statement SQL into chart queries.
+        """
+        self._model = cast(SqlaTable, self._model)
+        # `_validate_dataset_source` runs first and rebinds
+        # `self._properties["database"]` from the request's `database_id`
+        # to the resolved `Database` model when the user is repointing the
+        # dataset; otherwise the key is absent and we fall back to the
+        # currently-bound database on the model.
+        database = self._properties.get("database") or self._model.database
+        catalog = self._properties.get("catalog", self._model.catalog)
+        schema = self._properties.get("schema", self._model.schema)
+
+        for idx, item in enumerate(items):
+            expression = item.get("expression")
+            if not expression:
+                continue
+            try:
+                validate_stored_expression(database, catalog, schema, expression)
+            except (SupersetSecurityException, QueryClauseValidationException) as ex:
+                message = (
+                    ex.error.message
+                    if isinstance(ex, SupersetSecurityException)
+                    else ex.message
+                )
+                exceptions.append(
+                    ValidationError(
+                        message,
+                        field_name=f"{label}.{idx}.expression",
+                    )
+                )
+
+    def _validate_fetch_values_predicate(
+        self,
+        predicate: str,
+        exceptions: list[ValidationError],
+    ) -> None:
+        """
+        Validate ``fetch_values_predicate`` with the same parser-based
+        validator used for stored column and metric expressions.
+        """
+        self._model = cast(SqlaTable, self._model)
+        database = self._properties.get("database") or self._model.database
+        catalog = self._properties.get("catalog", self._model.catalog)
+        schema = self._properties.get("schema", self._model.schema)
+        try:
+            validate_stored_expression(database, catalog, schema, predicate)
+        except (SupersetSecurityException, QueryClauseValidationException) as ex:
+            message = (
+                ex.error.message
+                if isinstance(ex, SupersetSecurityException)
+                else ex.message
+            )
+            exceptions.append(
+                ValidationError(
+                    message,
+                    field_name="fetch_values_predicate",
+                )
+            )
+
+    @staticmethod
+    def _get_duplicates(data: list[dict[str, Any]], key: str) -> list[str]:
+        duplicates = [
+            name
+            for name, count in Counter([item[key] for item in data]).items()
+            if count > 1
+        ]
+        return duplicates
+
+
+def validate_folders(  # noqa: C901
+    folders: list[FolderSchema],
+    valid_uuids: set[UUID],
+) -> None:
+    """
+    Additional folder validation.
+
+    The marshmallow schema will validate the folder structure, but we still need to
+    check that UUIDs are valid, names are unique and not reserved, and that there are
+    no cycles.
+    """
+    if not is_feature_enabled("DATASET_FOLDERS"):
+        raise ValidationError("Dataset folders are not enabled")
+
+    queue: list[tuple[FolderSchema, list[UUID]]] = [(folder, []) for folder in folders]
+    seen_uuids = set()
+    seen_fqns = set()  # fully qualified folder names
+    while queue:
+        obj, path = queue.pop(0)
+        uuid, name = obj["uuid"], obj.get("name")
+
+        if uuid in path:
+            raise ValidationError(f"Cycle detected: {uuid} appears in its ancestry")
+
+        if uuid in seen_uuids:
+            raise ValidationError(f"Duplicate UUID in folder structure: {uuid}")
+        seen_uuids.add(uuid)
+
+        # folders can have duplicate name as long as they're not siblings
+        if name:
+            fqn = tuple(path + [name])
+            if name and fqn in seen_fqns:
+                raise ValidationError(f"Duplicate folder name: {name}")
+            seen_fqns.add(fqn)
+
+            # Allow default folders (by UUID) to use reserved names
+            if (
+                name.lower() in {"metrics", "columns"}
+                and str(uuid) not in DEFAULT_FOLDER_UUIDS
+            ):
+                raise ValidationError(f"Folder cannot have name '{name}'")
+
+        # check if metric/column UUID exists (skip default folders)
+        elif (
+            not name
+            and uuid not in valid_uuids
+            and str(uuid) not in DEFAULT_FOLDER_UUIDS
+        ):
+            raise ValidationError(f"Invalid UUID: {uuid}")
+
+        # traverse children
+        if children := obj.get("children"):
+            path.append(uuid)
+            queue.extend((folder, path) for folder in children)

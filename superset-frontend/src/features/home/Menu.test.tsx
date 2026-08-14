@@ -1,0 +1,1213 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import * as reactRedux from 'react-redux';
+import fetchMock from 'fetch-mock';
+import { render, screen, userEvent } from 'spec/helpers/testing-library';
+import setupCodeOverrides from 'src/setup/setupCodeOverrides';
+import { getExtensionsRegistry } from '@superset-ui/core';
+import * as CoreTheme from '@apache-superset/core/theme';
+import { Menu } from './Menu';
+import * as getBootstrapData from 'src/utils/getBootstrapData';
+
+// Capture what `<GenericLink to={...}>` receives so the SPA-route regression
+// tests can assert on the value handed to react-router-dom (which applies its
+// own basename in production via `<Router basename={applicationRoot()}>` in
+// src/views/App.tsx). The test harness's `<BrowserRouter>` has no basename,
+// so asserting on the rendered `<a href>` wouldn't catch the double-prefix.
+let observedGenericLinkTo: unknown = null;
+jest.mock('src/components/GenericLink', () => ({
+  __esModule: true,
+  GenericLink: ({
+    to,
+    children,
+    ...rest
+  }: {
+    to: unknown;
+    children: React.ReactNode;
+    [k: string]: unknown;
+  }) => {
+    observedGenericLinkTo = to;
+    return (
+      <a
+        href={typeof to === 'string' ? to : '#'}
+        {...(rest as Record<string, unknown>)}
+      >
+        {children}
+      </a>
+    );
+  },
+}));
+
+jest.mock('@apache-superset/core/theme', () => ({
+  ...jest.requireActual('@apache-superset/core/theme'),
+  useTheme: jest.fn(),
+}));
+
+const mockUseBreakpoint = jest.fn<{ md?: boolean }, []>(() => ({ md: true }));
+
+jest.mock('antd', () => {
+  const actual = jest.requireActual('antd');
+  return {
+    ...actual,
+    Grid: {
+      ...actual.Grid,
+      useBreakpoint: () => mockUseBreakpoint(),
+    },
+  };
+});
+
+const dropdownItems = [
+  {
+    label: 'Data',
+    icon: 'fa-database',
+    childs: [
+      {
+        label: 'Connect Database',
+        name: 'dbconnect',
+        perm: true,
+      },
+      {
+        label: 'Connect Google Sheet',
+        name: 'gsheets',
+        perm: true,
+      },
+      {
+        label: 'Upload a CSV',
+        name: 'Upload a CSV',
+        url: '#',
+        perm: true,
+      },
+      {
+        label: 'Upload a Columnar File',
+        name: 'Upload a Columnar file',
+        url: '#',
+        perm: true,
+      },
+      {
+        label: 'Upload Excel',
+        name: 'Upload Excel',
+        url: '#',
+        perm: true,
+      },
+    ],
+  },
+  {
+    label: 'SQL query',
+    url: '/sqllab?new=true',
+    icon: 'fa-fw fa-search',
+    perm: 'can_sqllab',
+    view: 'Superset',
+  },
+  {
+    label: 'Chart',
+    url: '/chart/add',
+    icon: 'fa-fw fa-bar-chart',
+    perm: 'can_write',
+    view: 'Chart',
+  },
+  {
+    label: 'Dashboard',
+    url: '/dashboard/new/',
+    icon: 'fa-fw fa-dashboard',
+    perm: 'can_write',
+    view: 'Dashboard',
+  },
+];
+
+const user = {
+  createdOn: '2021-04-27T18:12:38.952304',
+  email: 'admin',
+  firstName: 'admin',
+  isActive: true,
+  lastName: 'admin',
+  permissions: {},
+  roles: {
+    Admin: [
+      ['can_sqllab', 'Superset'],
+      ['can_write', 'Dashboard'],
+      ['can_write', 'Chart'],
+    ],
+  },
+  userId: 1,
+  username: 'admin',
+};
+
+const mockedProps = {
+  user,
+  data: {
+    menu: [
+      {
+        name: 'Home',
+        icon: '',
+        label: 'Home',
+        url: '/superset/welcome',
+        index: 1,
+      },
+      {
+        name: 'Sources',
+        icon: 'fa-table',
+        label: 'Sources',
+        index: 2,
+        childs: [
+          {
+            name: 'Datasets',
+            icon: 'fa-table',
+            label: 'Datasets',
+            url: '/tablemodelview/list/',
+            index: 1,
+          },
+          '-',
+          {
+            name: 'Databases',
+            icon: 'fa-database',
+            label: 'Databases',
+            url: '/databaseview/list/',
+            index: 2,
+          },
+        ],
+      },
+      {
+        name: 'Charts',
+        icon: 'fa-bar-chart',
+        label: 'Charts',
+        url: '/chart/list/',
+        index: 3,
+      },
+      {
+        name: 'Dashboards',
+        icon: 'fa-dashboard',
+        label: 'Dashboards',
+        url: '/dashboard/list/',
+        index: 4,
+      },
+      {
+        name: 'Data',
+        icon: 'fa-database',
+        label: 'Data',
+        childs: [
+          {
+            name: 'Databases',
+            icon: 'fa-database',
+            label: 'Databases',
+            url: '/databaseview/list/',
+          },
+          {
+            name: 'Datasets',
+            icon: 'fa-table',
+            label: 'Datasets',
+            url: '/tablemodelview/list/',
+          },
+          '-',
+        ],
+      },
+    ],
+    brand: {
+      path: '/superset/welcome/',
+      icon: '/static/assets/images/superset-logo-horiz.png',
+      alt: 'Apache Superset',
+      width: '126',
+      tooltip: '',
+      text: '',
+    },
+    environment_tag: {
+      text: 'Production',
+      color: '#000',
+    },
+    navbar_right: {
+      show_watermark: false,
+      bug_report_url: '/report/',
+      documentation_url: '/docs/',
+      languages: {
+        en: {
+          flag: 'us',
+          name: 'English',
+          url: '/lang/en',
+        },
+        it: {
+          flag: 'it',
+          name: 'Italian',
+          url: '/lang/it',
+        },
+      },
+      show_language_picker: true,
+      user_is_anonymous: true,
+      user_info_url: '/users/userinfo/',
+      user_logout_url: '/logout/',
+      user_login_url: '/login/',
+      locale: 'en',
+      version_string: '1.0.0',
+      version_sha: 'randomSHA',
+      build_number: 'randomBuildNumber',
+    },
+    settings: [
+      {
+        name: 'Security',
+        icon: 'fa-cogs',
+        label: 'Security',
+        index: 1,
+        childs: [
+          {
+            name: 'List Users',
+            icon: 'fa-user',
+            label: 'List Users',
+            url: '/users/list/',
+            index: 1,
+          },
+        ],
+      },
+    ],
+  },
+};
+
+const notanonProps = {
+  ...mockedProps,
+  data: {
+    ...mockedProps.data,
+    navbar_right: {
+      ...mockedProps.data.navbar_right,
+      user_is_anonymous: false,
+    },
+  },
+};
+
+const useSelectorMock = jest.spyOn(reactRedux, 'useSelector');
+const staticAssetsPrefixMock = jest.spyOn(
+  getBootstrapData,
+  'staticAssetsPrefix',
+);
+const applicationRootMock = jest.spyOn(getBootstrapData, 'applicationRoot');
+const useThemeMock = CoreTheme.useTheme as jest.Mock;
+
+fetchMock.get(
+  'glob:*api/v1/database/?q=(filters:!((col:allow_file_upload,opr:upload_is_enabled,value:!t)))',
+  {},
+);
+
+beforeEach(() => {
+  // setup a DOM element as a render target
+  useSelectorMock.mockClear();
+  // By default use empty static assets prefix and default app root
+  staticAssetsPrefixMock.mockReturnValue('');
+  applicationRootMock.mockReturnValue('');
+  // By default useTheme returns the real default theme (brandLogoUrl is falsy)
+  useThemeMock.mockReturnValue(CoreTheme.supersetTheme);
+  // By default simulate a desktop viewport (md breakpoint active)
+  mockUseBreakpoint.mockReturnValue({ md: true });
+});
+
+test('should render', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  const { container } = render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  expect(await screen.findByText(/sources/i)).toBeInTheDocument();
+  expect(container).toBeInTheDocument();
+});
+
+test('should render the navigation', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  expect(await screen.findByRole('navigation')).toBeInTheDocument();
+});
+
+test.each(['', '/myapp'])(
+  'should render the brand, including app_root "%s"',
+  async app_root => {
+    staticAssetsPrefixMock.mockReturnValue(app_root);
+    useSelectorMock.mockReturnValue({ roles: user.roles });
+    const {
+      data: {
+        brand: { alt, icon },
+      },
+    } = mockedProps;
+    render(<Menu {...mockedProps} />, {
+      useRedux: true,
+      useQueryParams: true,
+      useRouter: true,
+      useTheme: true,
+    });
+    expect(await screen.findByAltText(alt)).toBeInTheDocument();
+    const image = screen.getByAltText(alt);
+    expect(image).toHaveAttribute('src', `${app_root}${icon}`);
+  },
+);
+
+test('should render the environment tag', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  const {
+    data: { environment_tag },
+  } = mockedProps;
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  expect(await screen.findByText(environment_tag.text)).toBeInTheDocument();
+});
+
+test('should render all the top navbar menu items', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  const {
+    data: { menu },
+  } = mockedProps;
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  expect(await screen.findByText(menu[0].label)).toBeInTheDocument();
+  menu.forEach(item => {
+    expect(screen.getByText(item.label)).toBeInTheDocument();
+  });
+});
+
+test('should render the top navbar child menu items', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  const {
+    data: { menu },
+  } = mockedProps;
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  const sources = await screen.findByText('Sources');
+  userEvent.hover(sources);
+
+  const datasets = await screen.findByText('Datasets');
+  const databases = await screen.findByText('Databases');
+  const dataset = menu[1].childs![0] as { url: string };
+  const database = menu[1].childs![2] as { url: string };
+
+  expect(datasets).toHaveAttribute('href', dataset.url);
+  expect(databases).toHaveAttribute('href', database.url);
+});
+
+test('should render the dropdown items', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  render(<Menu {...notanonProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  const dropdown = screen.getByTestId('new-dropdown-icon');
+  userEvent.hover(dropdown);
+  // todo (philip): test data submenu
+  expect(await screen.findByText(dropdownItems[1].label)).toHaveAttribute(
+    'href',
+    dropdownItems[1].url,
+  );
+  expect(await screen.findByText(dropdownItems[1].label)).toHaveAttribute(
+    'href',
+    dropdownItems[1].url,
+  );
+  expect(
+    screen.getByTestId(`menu-item-${dropdownItems[1].label}`),
+  ).toBeInTheDocument();
+  expect(await screen.findByText(dropdownItems[2].label)).toHaveAttribute(
+    'href',
+    dropdownItems[2].url,
+  );
+  expect(
+    screen.getByTestId(`menu-item-${dropdownItems[2].label}`),
+  ).toBeInTheDocument();
+});
+
+test('should render the Settings', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  const settings = await screen.findByText('Settings');
+  expect(settings).toBeInTheDocument();
+});
+
+test('should render the Settings menu item', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  userEvent.hover(screen.getByText('Settings'));
+  const label = await screen.findByText('Security');
+  expect(label).toBeInTheDocument();
+});
+
+test('should render the Settings dropdown child menu items', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  const {
+    data: { settings },
+  } = mockedProps;
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  userEvent.hover(screen.getByText('Settings'));
+  const listUsers = await screen.findByText('List Users');
+  expect(listUsers).toHaveAttribute('href', settings[0].childs[0].url);
+});
+
+test('should render the plus menu (+) when user is not anonymous', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  render(<Menu {...notanonProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  expect(await screen.findByTestId('new-dropdown-icon')).toBeInTheDocument();
+});
+
+test('should NOT render the plus menu (+) when user is anonymous', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  expect(await screen.findByText(/sources/i)).toBeInTheDocument();
+  expect(screen.queryByTestId('new-dropdown')).not.toBeInTheDocument();
+});
+
+test('should render the user actions when user is not anonymous', async () => {
+  useSelectorMock.mockReturnValue({ roles: mockedProps.user.roles });
+  const {
+    data: {
+      navbar_right: { user_info_url, user_logout_url },
+    },
+  } = mockedProps;
+
+  render(<Menu {...notanonProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  userEvent.hover(screen.getByText('Settings'));
+  const user = await screen.findByText('User');
+  expect(user).toBeInTheDocument();
+
+  const info = await screen.findByText('Info');
+  const logout = await screen.findByText('Logout');
+
+  expect(info).toHaveAttribute('href', user_info_url);
+  expect(logout).toHaveAttribute('href', user_logout_url);
+});
+
+test('should NOT render the user actions when user is anonymous', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  expect(await screen.findByText(/sources/i)).toBeInTheDocument();
+  expect(screen.queryByText('User')).not.toBeInTheDocument();
+});
+
+test('should render the About section and version_string, sha or build_number when available', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  const {
+    data: {
+      navbar_right: { version_sha, version_string, build_number },
+    },
+  } = mockedProps;
+
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  userEvent.hover(screen.getByText('Settings'));
+  const about = await screen.findByText('About');
+
+  // The version information is rendered as combined text in a single element
+  // Use getAllByText to get all matching elements and check the first one
+  const versionTexts = await screen.findAllByText(
+    (_, element) =>
+      element?.textContent?.includes(`Version: ${version_string}`) ?? false,
+  );
+  const shaTexts = await screen.findAllByText(
+    (_, element) =>
+      element?.textContent?.includes(`SHA: ${version_sha}`) ?? false,
+  );
+  const buildTexts = await screen.findAllByText(
+    (_, element) =>
+      element?.textContent?.includes(`Build: ${build_number}`) ?? false,
+  );
+
+  expect(about).toBeInTheDocument();
+  expect(versionTexts[0]).toBeInTheDocument();
+  expect(shaTexts[0]).toBeInTheDocument();
+  expect(buildTexts[0]).toBeInTheDocument();
+});
+
+test('should render the Documentation link when available', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  const {
+    data: {
+      navbar_right: { documentation_url },
+    },
+  } = mockedProps;
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  userEvent.hover(screen.getByText('Settings'));
+  const doc = await screen.findByTitle('Documentation');
+  expect(doc).toHaveAttribute('href', documentation_url);
+});
+
+test('should render the Bug Report link when available', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  const {
+    data: {
+      navbar_right: { bug_report_url },
+    },
+  } = mockedProps;
+
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  const bugReport = await screen.findByTitle('Report a bug');
+  expect(bugReport).toHaveAttribute('href', bug_report_url);
+});
+
+test('should render the Login link when user is anonymous', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  const {
+    data: {
+      navbar_right: { user_login_url },
+    },
+  } = mockedProps;
+
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  const login = await screen.findByText('Login');
+  expect(login).toHaveAttribute('href', user_login_url);
+});
+
+test('should render the Language Picker', async () => {
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  expect(await screen.findByLabelText('Languages')).toBeInTheDocument();
+});
+
+test('should hide create button without proper roles', async () => {
+  useSelectorMock.mockReturnValue({ roles: [] });
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  expect(await screen.findByText(/sources/i)).toBeInTheDocument();
+  expect(screen.queryByTestId('new-dropdown')).not.toBeInTheDocument();
+});
+
+test('should render without QueryParamProvider', async () => {
+  useSelectorMock.mockReturnValue({ roles: [] });
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useRouter: true,
+    useQueryParams: true,
+    useTheme: true,
+  });
+  expect(await screen.findByText(/sources/i)).toBeInTheDocument();
+  expect(screen.queryByTestId('new-dropdown')).not.toBeInTheDocument();
+});
+
+test('should render an extension component if one is supplied', async () => {
+  const extensionsRegistry = getExtensionsRegistry();
+
+  extensionsRegistry.set('navbar.right', () => (
+    <>navbar.right extension component</>
+  ));
+
+  setupCodeOverrides();
+
+  render(<Menu {...mockedProps} />, {
+    useRouter: true,
+    useQueryParams: true,
+    useRedux: true,
+    useTheme: true,
+  });
+
+  const extension = await screen.findAllByText(
+    'navbar.right extension component',
+  );
+
+  expect(extension[0]).toBeInTheDocument();
+});
+
+test('should render the brand text if available', async () => {
+  useSelectorMock.mockReturnValue({ roles: [] });
+
+  const modifiedProps = {
+    ...mockedProps,
+    data: {
+      ...mockedProps.data,
+      brand: {
+        ...mockedProps.data.brand,
+        text: 'Welcome to Superset',
+      },
+    },
+  };
+
+  render(<Menu {...modifiedProps} />, {
+    useRouter: true,
+    useQueryParams: true,
+    useRedux: true,
+    useTheme: true,
+  });
+
+  const brandText = await screen.findByText('Welcome to Superset');
+  expect(brandText).toBeInTheDocument();
+});
+
+test('should not render the brand text if not available', async () => {
+  useSelectorMock.mockReturnValue({ roles: [] });
+  const text = 'Welcome to Superset';
+  render(<Menu {...mockedProps} />, {
+    useRouter: true,
+    useQueryParams: true,
+    useRedux: true,
+    useTheme: true,
+  });
+
+  const brandText = screen.queryByText(text);
+  expect(brandText).not.toBeInTheDocument();
+});
+
+test('brand logo href should not be prefixed with app root when brandLogoHref is an absolute URL', async () => {
+  applicationRootMock.mockReturnValue('/superset');
+  useThemeMock.mockReturnValue({
+    ...CoreTheme.supersetTheme,
+    brandLogoUrl: '/static/assets/images/custom-logo.png',
+    brandLogoHref: 'https://external.example.com',
+  });
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+
+  const brandLink = await screen.findByRole('link', {
+    name: /apache superset/i,
+  });
+  expect(brandLink).toHaveAttribute('href', 'https://external.example.com');
+});
+
+test('brand logo href should not be prefixed with app root when brandLogoHref is protocol-relative', async () => {
+  applicationRootMock.mockReturnValue('/superset');
+  useThemeMock.mockReturnValue({
+    ...CoreTheme.supersetTheme,
+    brandLogoUrl: '/static/assets/images/custom-logo.png',
+    brandLogoHref: '//external.example.com',
+  });
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+
+  const brandLink = await screen.findByRole('link', {
+    name: /apache superset/i,
+  });
+  expect(brandLink).toHaveAttribute('href', '//external.example.com');
+});
+
+test('brand path should be prefixed with app root in subdirectory deployment', async () => {
+  applicationRootMock.mockReturnValue('/superset');
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+
+  const propsWithSimplePath = {
+    ...mockedProps,
+    data: {
+      ...mockedProps.data,
+      brand: {
+        ...mockedProps.data.brand,
+        path: '/welcome/',
+      },
+    },
+  };
+
+  render(<Menu {...propsWithSimplePath} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+
+  const brandLink = await screen.findByRole('link', {
+    name: new RegExp(propsWithSimplePath.data.brand.alt, 'i'),
+  });
+  expect(brandLink).toHaveAttribute('href', '/superset/welcome/');
+});
+
+test('brand link falls back to brand.path when theme brandLogoUrl is absent', async () => {
+  // useThemeMock default returns supersetTheme with brandLogoUrl undefined (falsy)
+  applicationRootMock.mockReturnValue('/superset');
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+
+  const propsWithFallbackPath = {
+    ...mockedProps,
+    data: {
+      ...mockedProps.data,
+      brand: {
+        ...mockedProps.data.brand,
+        path: '/welcome/',
+      },
+    },
+  };
+
+  render(<Menu {...propsWithFallbackPath} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+
+  const brandLink = await screen.findByRole('link', {
+    name: new RegExp(propsWithFallbackPath.data.brand.alt, 'i'),
+  });
+  // ensureAppRoot must have been applied: /welcome/ → /superset/welcome/
+  expect(brandLink).toHaveAttribute('href', '/superset/welcome/');
+});
+
+// Regression: the real backend emits `brand.path` and `brand.icon` already
+// carrying the app root (because they pass through `url_for`). The frontend
+// must not double-prefix them — neither via
+// `ensureAppRoot`/`ensureStaticPrefix` nor via React Router's `basename`
+// re-prepend.
+//
+// In production the SPA-route branch goes through `<GenericLink to={...}> ->
+// react-router-dom <Link>`, and the Router's `basename={applicationRoot()}`
+// (src/views/App.tsx) re-prepends the app root to the rendered `href`. The
+// test harness's `<BrowserRouter>` has no basename, so asserting on the
+// rendered `<a href>` wouldn't catch the bug. Instead we mock `GenericLink`
+// at module load (top of this file) and assert the path *handed to it*
+// already has the root stripped — the value the production Router will then
+// safely re-prepend.
+
+describe('brand link single-prefix regressions (subdirectory deployment)', () => {
+  beforeEach(() => {
+    observedGenericLinkTo = null;
+  });
+
+  test('brand link hands a root-stripped path to GenericLink when brand.path arrives already rooted (SPA route)', async () => {
+    applicationRootMock.mockReturnValue('/superset');
+    staticAssetsPrefixMock.mockReturnValue('/superset');
+    useSelectorMock.mockReturnValue({ roles: user.roles });
+
+    const propsWithRootedBrand = {
+      ...mockedProps,
+      isFrontendRoute: () => true,
+      data: {
+        ...mockedProps.data,
+        brand: {
+          ...mockedProps.data.brand,
+          path: '/superset/welcome/',
+          icon: '/superset/static/assets/images/superset-logo-horiz.png',
+        },
+      },
+    };
+
+    render(<Menu {...propsWithRootedBrand} />, {
+      useRedux: true,
+      useQueryParams: true,
+      useRouter: true,
+      useTheme: true,
+    });
+
+    // Wait for the mocked GenericLink to render.
+    await screen.findByRole('link', {
+      name: new RegExp(propsWithRootedBrand.data.brand.alt, 'i'),
+    });
+    expect(observedGenericLinkTo).toBe('/welcome/');
+  });
+
+  test('brand link is single-prefix when brand.path arrives already rooted (non-SPA route)', async () => {
+    applicationRootMock.mockReturnValue('/superset');
+    staticAssetsPrefixMock.mockReturnValue('/superset');
+    useSelectorMock.mockReturnValue({ roles: user.roles });
+
+    const propsWithRootedBrand = {
+      ...mockedProps,
+      isFrontendRoute: () => false,
+      data: {
+        ...mockedProps.data,
+        brand: {
+          ...mockedProps.data.brand,
+          path: '/superset/welcome/',
+          icon: '/superset/static/assets/images/superset-logo-horiz.png',
+        },
+      },
+    };
+
+    render(<Menu {...propsWithRootedBrand} />, {
+      useRedux: true,
+      useQueryParams: true,
+      useRouter: true,
+      useTheme: true,
+    });
+
+    const brandLink = await screen.findByRole('link', {
+      name: new RegExp(propsWithRootedBrand.data.brand.alt, 'i'),
+    });
+    expect(brandLink).toHaveAttribute('href', '/superset/welcome/');
+    const brandImg = brandLink.querySelector('img');
+    expect(brandImg).toHaveAttribute(
+      'src',
+      '/superset/static/assets/images/superset-logo-horiz.png',
+    );
+  });
+
+  test('brand link strips a nested application root before handing to GenericLink', async () => {
+    applicationRootMock.mockReturnValue('/preset/superset');
+    staticAssetsPrefixMock.mockReturnValue('/preset/superset');
+    useSelectorMock.mockReturnValue({ roles: user.roles });
+
+    const propsWithRootedBrand = {
+      ...mockedProps,
+      isFrontendRoute: () => true,
+      data: {
+        ...mockedProps.data,
+        brand: {
+          ...mockedProps.data.brand,
+          path: '/preset/superset/welcome/',
+          icon: '/preset/superset/static/assets/images/superset-logo-horiz.png',
+        },
+      },
+    };
+
+    render(<Menu {...propsWithRootedBrand} />, {
+      useRedux: true,
+      useQueryParams: true,
+      useRouter: true,
+      useTheme: true,
+    });
+
+    await screen.findByRole('link', {
+      name: new RegExp(propsWithRootedBrand.data.brand.alt, 'i'),
+    });
+    expect(observedGenericLinkTo).toBe('/welcome/');
+  });
+
+  test('brand link from theme.brandLogoHref hands a root-stripped path to GenericLink when already rooted', async () => {
+    applicationRootMock.mockReturnValue('/superset');
+    staticAssetsPrefixMock.mockReturnValue('/superset');
+    useSelectorMock.mockReturnValue({ roles: user.roles });
+
+    useThemeMock.mockReturnValue({
+      ...CoreTheme.supersetTheme,
+      brandLogoUrl: '/superset/static/assets/images/custom-logo.png',
+      brandLogoHref: '/superset/welcome/',
+    });
+
+    render(<Menu {...mockedProps} />, {
+      useRedux: true,
+      useQueryParams: true,
+      useRouter: true,
+      useTheme: true,
+    });
+
+    const brandLink = await screen.findByRole('link', {
+      name: /apache superset/i,
+    });
+    // The internal brand logo link goes through StyledBrandLink -> GenericLink
+    // -> react-router <Link>. The production Router re-prepends the app root, so
+    // the value handed to GenericLink must already be stripped to avoid a
+    // doubled /superset/superset/... href. (Real-basename coverage of the
+    // resulting rendered href lives in Menu.subdirectory.test.tsx.)
+    expect(observedGenericLinkTo).toBe('/welcome/');
+    expect(brandLink).toHaveAttribute('href', '/welcome/');
+    const brandImg = brandLink.querySelector('img');
+    expect(brandImg).toHaveAttribute(
+      'src',
+      '/superset/static/assets/images/custom-logo.png',
+    );
+  });
+});
+
+// --- Active tab highlighting (regression tests for issue #36403) ---
+//
+// The active top-level tab is highlighted by matching the current route to a
+// menu item. The matching must rely on a stable identifier (the FAB `name`),
+// not the displayed label, otherwise highlighting breaks for any non-English
+// locale where the label is translated.
+
+// Returns the top-level <li> that contains the given visible text, so we can
+// assert whether antd marked it as the selected menu item.
+const getMenuItemByText = (text: string): HTMLElement | null =>
+  screen.getByText(text).closest('li');
+
+// Scoped in a describe so the route-resetting afterEach only applies to these
+// tests and does not leak into the rest of the file.
+describe('active tab highlighting (regression #36403)', () => {
+  afterEach(() => {
+    // Reset the route so a pushed path does not leak into the next test.
+    window.history.pushState({}, '', '/');
+  });
+
+  test('highlights the active top-level tab on a matching route (English)', async () => {
+    useSelectorMock.mockReturnValue({ roles: user.roles });
+    window.history.pushState({}, '', '/dashboard/list/');
+
+    render(<Menu {...mockedProps} />, {
+      useRedux: true,
+      useQueryParams: true,
+      useRouter: true,
+      useTheme: true,
+    });
+
+    await screen.findByText('Dashboards');
+    expect(getMenuItemByText('Dashboards')).toHaveClass(
+      'ant-menu-item-selected',
+    );
+  });
+
+  test('highlights the active top-level tab when the label is localized', async () => {
+    // Russian locale: the FAB `name` stays the stable English identifier while
+    // the displayed `label` is translated. Highlighting must still work.
+    const localizedProps = {
+      ...mockedProps,
+      data: {
+        ...mockedProps.data,
+        menu: mockedProps.data.menu.map(item =>
+          item.name === 'Dashboards' ? { ...item, label: 'Дашборды' } : item,
+        ),
+      },
+    };
+
+    useSelectorMock.mockReturnValue({ roles: user.roles });
+    window.history.pushState({}, '', '/dashboard/list/');
+
+    render(<Menu {...localizedProps} />, {
+      useRedux: true,
+      useQueryParams: true,
+      useRouter: true,
+      useTheme: true,
+    });
+
+    await screen.findByText('Дашборды');
+    expect(getMenuItemByText('Дашборды')).toHaveClass('ant-menu-item-selected');
+  });
+
+  test.each([
+    ['/tablemodelview/list/', 'the legacy FAB dataset list route'],
+    ['/dataset/add/', 'the modern React dataset create route'],
+    ['/dataset/42', 'a dataset detail route'],
+  ])(
+    'highlights the Datasets tab on %s (%s) — regression #42467',
+    async (route, _label) => {
+      // ``/tablemodelview/list/`` is the pre-existing legacy path (kept as
+      // a coverage anchor so future prefix-matching changes cannot silently
+      // regress it); the ``/dataset/*`` routes are the modern React ones
+      // added by #42467.
+      useSelectorMock.mockReturnValue({ roles: user.roles });
+      window.history.pushState({}, '', route);
+
+      render(<Menu {...mockedProps} />, {
+        useRedux: true,
+        useQueryParams: true,
+        useRouter: true,
+        useTheme: true,
+      });
+
+      // Datasets is a child under the Sources submenu — expand it first so
+      // the item is in the DOM (same pattern as the existing "render the top
+      // navbar child menu items" test).
+      const sources = await screen.findByText('Sources');
+      userEvent.hover(sources);
+
+      const datasets = await screen.findByText('Datasets');
+      expect(datasets.closest('li')).toHaveClass('ant-menu-item-selected');
+    },
+  );
+
+  test('does not highlight the Datasets tab on lookalike prefixes (e.g. /datasetXyz)', async () => {
+    // The active-tab matcher must use a boundary-aware startsWith so that
+    // an unrelated future route beginning with ``/dataset`` (e.g. a
+    // hypothetical ``/datasetXyz``) does not falsely trigger the highlight.
+    useSelectorMock.mockReturnValue({ roles: user.roles });
+    window.history.pushState({}, '', '/datasetXyz');
+
+    render(<Menu {...mockedProps} />, {
+      useRedux: true,
+      useQueryParams: true,
+      useRouter: true,
+      useTheme: true,
+    });
+
+    const sources = await screen.findByText('Sources');
+    userEvent.hover(sources);
+
+    const datasets = await screen.findByText('Datasets');
+    expect(datasets.closest('li')).not.toHaveClass('ant-menu-item-selected');
+  });
+
+  test('highlights the active SQL tab when the label is localized', async () => {
+    // The SQL Lab top-level entry is a FAB category: its stable `name` is
+    // "SQL Lab" while its label ("SQL") is localized.
+    const localizedProps = {
+      ...mockedProps,
+      data: {
+        ...mockedProps.data,
+        menu: [
+          ...mockedProps.data.menu,
+          {
+            name: 'SQL Lab',
+            icon: 'fa-flask',
+            label: 'SQL запросы',
+            childs: [
+              {
+                name: 'SQL Editor',
+                label: 'SQL Lab',
+                url: '/sqllab/',
+                index: 1,
+              },
+            ],
+          },
+        ],
+      },
+    };
+
+    useSelectorMock.mockReturnValue({ roles: user.roles });
+    window.history.pushState({}, '', '/sqllab/');
+
+    render(<Menu {...localizedProps} />, {
+      useRedux: true,
+      useQueryParams: true,
+      useRouter: true,
+      useTheme: true,
+    });
+
+    await screen.findByText('SQL запросы');
+    // SQL Lab renders as a submenu, so antd marks it with the submenu variant.
+    expect(getMenuItemByText('SQL запросы')).toHaveClass(
+      'ant-menu-submenu-selected',
+    );
+  });
+});
+
+test('navbar renders horizontal when breakpoints are not yet measured on a wide viewport (regression for layout flash)', async () => {
+  // Simulate first paint: useBreakpoint returns {} before the viewport is
+  // measured, so the layout falls back to the viewport width (jsdom defaults
+  // to 1024px, above the md threshold) → mode="horizontal".
+  mockUseBreakpoint.mockReturnValue({});
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  const navbar = await screen.findByTestId('navbar-top');
+  expect(navbar).toHaveClass('ant-menu-horizontal');
+  expect(navbar).not.toHaveClass('ant-menu-inline');
+});
+
+test('navbar renders inline when breakpoints are not yet measured on a narrow viewport', async () => {
+  // Simulate first paint on a mobile-sized window: useBreakpoint returns {}
+  // and the viewport-width fallback (below the md threshold) → mode="inline",
+  // so mobile users don't see a horizontal flash either.
+  const originalInnerWidth = window.innerWidth;
+  Object.defineProperty(window, 'innerWidth', {
+    configurable: true,
+    writable: true,
+    value: 500,
+  });
+  try {
+    mockUseBreakpoint.mockReturnValue({});
+    useSelectorMock.mockReturnValue({ roles: user.roles });
+    render(<Menu {...mockedProps} />, {
+      useRedux: true,
+      useQueryParams: true,
+      useRouter: true,
+      useTheme: true,
+    });
+    const navbar = await screen.findByTestId('navbar-top');
+    expect(navbar).toHaveClass('ant-menu-inline');
+    expect(navbar).not.toHaveClass('ant-menu-horizontal');
+  } finally {
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      writable: true,
+      value: originalInnerWidth,
+    });
+  }
+});
+
+test('navbar renders inline on mobile viewport (md: false)', async () => {
+  // Simulate a mobile viewport where the md breakpoint has resolved to false,
+  // which takes precedence over the viewport-width fallback → mode="inline".
+  mockUseBreakpoint.mockReturnValue({ md: false });
+  useSelectorMock.mockReturnValue({ roles: user.roles });
+  render(<Menu {...mockedProps} />, {
+    useRedux: true,
+    useQueryParams: true,
+    useRouter: true,
+    useTheme: true,
+  });
+  const navbar = await screen.findByTestId('navbar-top');
+  expect(navbar).toHaveClass('ant-menu-inline');
+});

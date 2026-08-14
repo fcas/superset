@@ -1,0 +1,121 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+import ipaddress
+import platform
+import socket
+import subprocess
+
+# Networks that must never be reached via user-supplied hostnames.
+# Includes loopback, RFC-1918 private ranges, link-local (covers cloud
+# metadata endpoints such as 169.254.169.254), shared address space
+# (RFC 6598, 100.64.0.0/10), multicast (ip.is_global returns True for
+# multicast addresses in Python, so explicit blocking is required), and
+# IPv6 equivalents.
+_SSRF_UNSAFE_NETWORKS = (
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("224.0.0.0/4"),  # IPv4 multicast — is_global is True in Python
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("ff00::/8"),  # IPv6 multicast
+)
+
+PORT_TIMEOUT = 5
+PING_TIMEOUT = 5
+
+
+def is_safe_host(host: str) -> bool:
+    """
+    Return True if ``host`` resolves exclusively to public, globally-routable
+    IP addresses.
+
+    Returns False if any resolved address falls within a private, loopback,
+    link-local, or otherwise non-routable range.  An unresolvable host also
+    returns False.
+    """
+    try:
+        results = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    if not results:
+        return False
+    for _, _, _, _, sockaddr in results:
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            return False
+        # Unwrap IPv4-mapped IPv6 addresses (e.g. ::ffff:127.0.0.1) so they
+        # are checked against the IPv4 unsafe networks rather than bypassing.
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if not ip.is_global or any(ip in net for net in _SSRF_UNSAFE_NETWORKS):
+            return False
+    return True
+
+
+def is_port_open(host: str, port: int) -> bool:
+    """
+    Test if a given port in a host is open.
+    """
+    # pylint: disable=invalid-name
+    for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+        af, _, _, _, sockaddr = res
+        s = socket.socket(af, socket.SOCK_STREAM)
+        try:
+            s.settimeout(PORT_TIMEOUT)
+            s.connect(sockaddr)
+            s.shutdown(socket.SHUT_RDWR)
+            return True
+        except OSError as _:
+            continue
+        finally:
+            s.close()
+    return False
+
+
+def is_hostname_valid(host: str) -> bool:
+    """
+    Test if a given hostname can be resolved.
+    """
+    try:
+        socket.getaddrinfo(host, None)
+        return True
+    except socket.gaierror:
+        return False
+
+
+def is_host_up(host: str) -> bool:
+    """
+    Ping a host to see if it's up.
+
+    Note that if we don't get a response the host might still be up,
+    since many firewalls block ICMP packets.
+    """
+    param = "-n" if platform.system().lower() == "windows" else "-c"
+    command = ["ping", param, "1", host]
+    try:
+        output = subprocess.call(command, timeout=PING_TIMEOUT)  # noqa: S603
+    except subprocess.TimeoutExpired:
+        return False
+
+    return output == 0

@@ -1,0 +1,475 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+import logging
+import textwrap
+from dataclasses import dataclass
+from datetime import datetime
+from email.utils import make_msgid, parseaddr
+from io import BytesIO
+from typing import IO, Optional
+from zipfile import BadZipFile, ZipFile
+
+import nh3
+from flask import current_app
+from flask_babel import gettext as __
+from pytz import timezone
+
+from superset import is_feature_enabled
+from superset.exceptions import SupersetErrorsException
+from superset.reports.models import ReportRecipients, ReportRecipientType
+from superset.reports.notifications.base import BaseNotification, NotificationContent
+from superset.reports.notifications.exceptions import NotificationError
+from superset.utils import json
+from superset.utils.core import HeaderDataType, send_email_smtp
+from superset.utils.decorators import statsd_gauge
+from superset.utils.link_redirect import process_html_links
+
+logger = logging.getLogger(__name__)
+
+TABLE_TAGS = {"table", "th", "tr", "td", "thead", "tbody", "tfoot"}
+TABLE_ATTRIBUTES = {"colspan", "rowspan", "halign", "border", "class"}
+
+ALLOWED_TAGS = {
+    "a",
+    "abbr",
+    "acronym",
+    "b",
+    "blockquote",
+    "br",
+    "code",
+    "div",
+    "em",
+    "i",
+    "li",
+    "ol",
+    "p",
+    "strong",
+    "ul",
+}.union(TABLE_TAGS)
+
+ALLOWED_TABLE_ATTRIBUTES = dict.fromkeys(TABLE_TAGS, TABLE_ATTRIBUTES)
+ALLOWED_ATTRIBUTES = {
+    "a": {"href", "title"},
+    "abbr": {"title"},
+    "acronym": {"title"},
+    **ALLOWED_TABLE_ATTRIBUTES,
+}
+ZIP_LOCAL_FILE_HEADER = b"PK\x03\x04"
+
+
+@dataclass
+class EmailContent:
+    body: str
+    header_data: Optional[HeaderDataType] = None
+    data: Optional[dict[str, bytes | str]] = None
+    pdf: Optional[dict[str, bytes]] = None
+    images: Optional[dict[str, bytes]] = None
+
+
+def _get_csv_attachment_extension(content: bytes) -> str:
+    """Return ``zip`` for bundled CSV responses and ``csv`` otherwise."""
+    return "zip" if content.startswith(ZIP_LOCAL_FILE_HEADER) else "csv"
+
+
+def _get_xlsx_attachment_extension(content: bytes) -> str:
+    """
+    Return the attachment extension for bytes returned by the XLSX export endpoint.
+    """
+    try:
+        with ZipFile(BytesIO(content)) as zip_file:
+            names = zip_file.namelist()
+            if _is_xlsx_zip(names):
+                return "xlsx"
+
+            files = [name for name in names if not name.endswith("/")]
+            if files and all(name.lower().endswith(".xlsx") for name in files):
+                for name in files:
+                    with zip_file.open(name) as xlsx_file:
+                        if not _has_zip_signature(xlsx_file):
+                            return "xlsx"
+                return "zip"
+    except BadZipFile:
+        return "xlsx"
+
+    return "xlsx"
+
+
+def _is_xlsx_zip(names: list[str]) -> bool:
+    return "[Content_Types].xml" in names and "xl/workbook.xml" in names
+
+
+def _has_zip_signature(content: IO[bytes]) -> bool:
+    return content.read(len(ZIP_LOCAL_FILE_HEADER)) == ZIP_LOCAL_FILE_HEADER
+
+
+class EmailNotification(BaseNotification):  # pylint: disable=too-few-public-methods
+    """
+    Sends an email notification for a report recipient
+    """
+
+    type = ReportRecipientType.EMAIL
+
+    def __init__(
+        self, recipient: ReportRecipients, content: NotificationContent
+    ) -> None:
+        super().__init__(recipient, content)
+        # Stamp each notification with its own timestamp at construction, which
+        # happens per recipient immediately before the email is dispatched. The
+        # date rendered into the subject (when DATE_FORMAT_IN_EMAIL_SUBJECT is
+        # enabled) therefore tracks the dispatch time. A module- or class-level
+        # value would instead freeze on the first import in a long-running worker.
+        self.now = datetime.now(timezone("UTC"))
+
+    @property
+    def _name(self) -> str:
+        """Include date format in the name if feature flag is enabled"""
+        return (
+            self._parse_name(self._content.name)
+            if is_feature_enabled("DATE_FORMAT_IN_EMAIL_SUBJECT")
+            else self._content.name
+        )
+
+    @staticmethod
+    def _get_smtp_domain() -> str:
+        return parseaddr(current_app.config["SMTP_MAIL_FROM"])[1].split("@")[1]
+
+    def _error_template(self, text: str) -> str:
+        # The error text is derived from exception messages that can embed
+        # data-controlled content (e.g. crafted table/column names in a DB
+        # error). Strip all HTML before interpolating it into the email body,
+        # matching the sanitization applied to the normal content path.
+        # pylint: disable=no-member
+        safe_text = nh3.clean(text, tags=set(), attributes={})
+        if self._content.include_cta:
+            return __(
+                """
+                <p>Your report/alert was unable to be generated because of the following error: %(text)s</p>
+                <p>Please check your dashboard/chart for errors.</p>
+                <p><b><a href="%(url)s">%(call_to_action)s</a></b></p>
+                """,  # noqa: E501
+                text=safe_text,
+                url=self._content.url,
+                call_to_action=self._get_call_to_action(),
+            )
+        return __(
+            """
+            <p>Your report/alert was unable to be generated because of the following error: %(text)s</p>
+            <p>Please check your dashboard/chart for errors.</p>
+            """,  # noqa: E501
+            text=safe_text,
+        )
+
+    def _retry_error_template(self, text: str) -> str:
+        """HTML body for a per-retry-attempt failure notification."""
+        attempt = self._content.retry_attempt
+        max_attempts = self._content.retry_max_attempts
+        retries_remaining = (max_attempts or 0) - (attempt or 0)
+        # pylint: disable=no-member
+        safe_text = nh3.clean(text, tags=set(), attributes={})
+        cta_tag = self._render_call_to_action_paragraph()
+
+        return textwrap.dedent(
+            f"""
+            <html>
+              <head>
+                <style type="text/css">
+                  table, th, td {{
+                    border-collapse: collapse;
+                    border-color: rgb(200, 212, 227);
+                    color: rgb(42, 63, 95);
+                    padding: 4px 8px;
+                  }}
+                </style>
+              </head>
+              <body>
+                <h3>Report Generation Failed &mdash; Retry in Progress</h3>
+                <p>
+                  Your scheduled report
+                  <b>{nh3.clean(self._content.name, tags=set(), attributes={})}</b>
+                  encountered an error during generation.
+                  The system is automatically retrying.
+                </p>
+                <p><b>Retry attempt:</b> {attempt} of {max_attempts}
+                   &nbsp;&nbsp; <b>Retries remaining:</b> {retries_remaining}</p>
+                <p><b>Error details:</b> {safe_text}</p>
+                {cta_tag}
+              </body>
+            </html>
+            """
+        )
+
+    def _final_failure_template(self, text: str) -> str:
+        """HTML body for the final-failure email after all retries are exhausted."""
+        # pylint: disable=no-member
+        safe_text = nh3.clean(text, tags=set(), attributes={})
+        cta_tag = self._render_call_to_action_paragraph()
+        max_attempts = self._content.retry_max_attempts
+
+        return textwrap.dedent(
+            f"""
+            <html>
+              <head>
+                <style type="text/css">
+                  table, th, td {{
+                    border-collapse: collapse;
+                    border-color: rgb(200, 212, 227);
+                    color: rgb(42, 63, 95);
+                    padding: 4px 8px;
+                  }}
+                </style>
+              </head>
+              <body>
+                <h3>Report Generation Failed</h3>
+                <p>
+                  Your scheduled report
+                  <b>{nh3.clean(self._content.name, tags=set(), attributes={})}</b>
+                  failed to generate after <b>{max_attempts}</b> retry attempts.
+                </p>
+                <p><b>Error details:</b> {safe_text}</p>
+                <h4>What happened</h4>
+                <p>
+                  The system automatically retried {max_attempts} times, but was
+                  unable to successfully generate all charts in this report.
+                </p>
+                <h4>Next steps</h4>
+                <ul>
+                  <li>Review the error details above to identify the issue</li>
+                  <li>Check your data source connections and filters</li>
+                  <li>Verify that all charts are properly configured</li>
+                  <li>Try generating the report manually to troubleshoot</li>
+                  <li>Contact support if the issue persists</li>
+                </ul>
+                {cta_tag}
+              </body>
+            </html>
+            """
+        )
+
+    def _get_content(self) -> EmailContent:
+        if self._content.text and self._content.retry_attempt is not None:
+            return EmailContent(
+                body=self._retry_error_template(self._content.text),
+                header_data=self._content.header_data,
+            )
+        if self._content.text and self._content.retry_max_attempts is not None:
+            return EmailContent(
+                body=self._final_failure_template(self._content.text),
+                header_data=self._content.header_data,
+            )
+        if self._content.text:
+            return EmailContent(body=self._error_template(self._content.text))
+        # Get the domain from the 'From' address ..
+        # and make a message id without the < > in the end
+
+        domain = self._get_smtp_domain()
+        images = {}
+
+        if self._content.screenshots:
+            images = {
+                make_msgid(domain)[1:-1]: screenshot
+                for screenshot in self._content.screenshots
+            }
+
+        # Strip any malicious HTML from the description
+        # pylint: disable=no-member
+        description = nh3.clean(
+            self._content.description or "",
+            tags=ALLOWED_TAGS,
+            attributes=ALLOWED_ATTRIBUTES,
+        )
+
+        # Rewrite external links to go through the redirect warning page
+        description = process_html_links(description)
+
+        # Strip malicious HTML from embedded data, allowing only table elements
+        if self._content.embedded_data is not None:
+            df = self._content.embedded_data
+            # pylint: disable=no-member
+            html_table = nh3.clean(
+                df.to_html(na_rep="", index=True, escape=True),
+                # pandas will escape the HTML in cells already, so passing
+                # more allowed tags here will not work
+                tags=TABLE_TAGS,
+                attributes=ALLOWED_TABLE_ATTRIBUTES,
+            )
+            html_table = process_html_links(html_table)
+        else:
+            html_table = ""
+
+        img_tags = []
+        for msgid in images.keys():
+            img_tags.append(
+                f"""<div class="image">
+                    <img width="1000" src="cid:{msgid}">
+                </div>
+                """
+            )
+        img_tag = "".join(img_tags)
+        call_to_action_tag = self._render_call_to_action_tag()
+        body = textwrap.dedent(
+            f"""
+            <html>
+              <head>
+                <style type="text/css">
+                  table, th, td {{
+                    border-collapse: collapse;
+                    border-color: rgb(200, 212, 227);
+                    color: rgb(42, 63, 95);
+                    padding: 4px 8px;
+                  }}
+                  .image{{
+                      margin-bottom: 18px;
+                      min-width: 1000px;
+                  }}
+                </style>
+              </head>
+              <body>
+                <div>{description}</div>
+                <br>
+                {call_to_action_tag}
+                {html_table}
+                {img_tag}
+              </body>
+            </html>
+            """
+        )
+        # CSV and Excel are mutually exclusive (a report has a single format),
+        # so at most one tabular attachment is present in the data dict.
+        attachment_data: dict[str, bytes | str] | None = None
+        if self._content.csv:
+            extension = _get_csv_attachment_extension(self._content.csv)
+            attachment_data = {
+                __(
+                    "%(name)s.%(extension)s",
+                    name=self._name,
+                    extension=extension,
+                ): self._content.csv
+            }
+        elif self._content.xlsx:
+            extension = _get_xlsx_attachment_extension(self._content.xlsx)
+            attachment_data = {
+                __(
+                    "%(name)s.%(extension)s",
+                    name=self._name,
+                    extension=extension,
+                ): self._content.xlsx
+            }
+
+        pdf_data = None
+        if self._content.pdf:
+            pdf_data = {__("%(name)s.pdf", name=self._name): self._content.pdf}
+
+        return EmailContent(
+            body=body,
+            images=images,
+            pdf=pdf_data,
+            data=attachment_data,
+            header_data=self._content.header_data,
+        )
+
+    def _get_subject(self) -> str:
+        if self._content.retry_attempt is not None:
+            return __(
+                "Report Retry [%(attempt)s of %(max)s]: %(name)s",
+                attempt=self._content.retry_attempt,
+                max=self._content.retry_max_attempts,
+                name=self._name,
+            )
+        if self._content.text and self._content.retry_max_attempts is not None:
+            # Final-failure notification (retry_attempt is None but max is set)
+            return __(
+                "Report Failed - All Retries Exhausted: %(name)s",
+                name=self._name,
+            )
+        return __(
+            "%(prefix)s %(title)s",
+            prefix=current_app.config["EMAIL_REPORTS_SUBJECT_PREFIX"],
+            title=self._name,
+        )
+
+    def _parse_name(self, name: str) -> str:
+        """If user add a date format to the subject, parse it to the real date
+        This feature is hidden behind a feature flag `DATE_FORMAT_IN_EMAIL_SUBJECT`
+        by default it is disabled
+        """
+        return self.now.strftime(name)
+
+    def _get_call_to_action(self) -> str:
+        return __(current_app.config["EMAIL_REPORTS_CTA"])
+
+    def _render_call_to_action_tag(self) -> str:
+        """Anchor markup for the call-to-action link, or "" when disabled."""
+        if not self._content.include_cta:
+            return ""
+        call_to_action = self._get_call_to_action()
+        return f'<b><a href="{self._content.url}">{call_to_action}</a></b><p></p>'
+
+    def _render_call_to_action_paragraph(self) -> str:
+        """CTA link wrapped in a paragraph, or "" when disabled."""
+        if not self._content.include_cta:
+            return ""
+        call_to_action = self._get_call_to_action()
+        return f'<p><b><a href="{self._content.url}">{call_to_action}</a></b></p>'
+
+    def _get_to(self) -> str:
+        return json.loads(self._recipient.recipient_config_json)["target"]
+
+    def _get_cc(self) -> str:
+        # To accommodate backward compatibility
+        return json.loads(self._recipient.recipient_config_json).get("ccTarget", "")
+
+    def _get_bcc(self) -> str:
+        # To accommodate backward compatibility
+        return json.loads(self._recipient.recipient_config_json).get("bccTarget", "")
+
+    @statsd_gauge("reports.email.send")
+    def send(self) -> None:
+        subject = self._get_subject()
+        content = self._get_content()
+        to = self._get_to()
+        cc = self._get_cc()
+        bcc = self._get_bcc()
+
+        try:
+            send_email_smtp(
+                to,
+                subject,
+                content.body,
+                current_app.config,
+                files=[],
+                data=content.data,
+                pdf=content.pdf,
+                images=content.images,
+                mime_subtype="related",
+                dryrun=False,
+                cc=cc,
+                bcc=bcc,
+                header_data=content.header_data,
+            )
+            logger.info(
+                "Report sent to email, task_id: %s, notification content is %s",
+                content.header_data.get("execution_id")
+                if content.header_data
+                else None,
+                content.header_data,
+            )
+        except SupersetErrorsException as ex:
+            raise NotificationError(
+                ";".join([error.message for error in ex.errors])
+            ) from ex
+        except Exception as ex:
+            raise NotificationError(str(ex)) from ex

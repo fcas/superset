@@ -1,0 +1,1862 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+# pylint: disable=too-many-lines
+import logging
+from datetime import datetime
+from io import BytesIO
+from typing import Any, cast, Optional
+from zipfile import is_zipfile, ZipFile
+
+from flask import current_app, redirect, request, Response, send_file, url_for
+from flask_appbuilder.api import expose, protect, rison as parse_rison, safe
+from flask_appbuilder.hooks import before_request
+from flask_appbuilder.models.sqla.interface import SQLAInterface
+from flask_babel import ngettext
+from marshmallow import ValidationError
+from werkzeug.wrappers import Response as WerkzeugResponse
+from werkzeug.wsgi import FileWrapper
+
+from superset import is_feature_enabled
+from superset.charts.filters import (
+    ChartAllTextFilter,
+    ChartCertifiedFilter,
+    ChartCreatedByMeFilter,
+    ChartDeletedRecencyFilter,
+    ChartDeletedStateFilter,
+    ChartEditableFilter,
+    ChartFavoriteFilter,
+    ChartFilter,
+    ChartHasCreatedByFilter,
+    ChartOwnedCreatedFavoredByMeFilter,
+    ChartTagIdFilter,
+    ChartTagNameFilter,
+)
+from superset.charts.schemas import (
+    CHART_SCHEMAS,
+    ChartCacheWarmUpRequestSchema,
+    ChartGetResponseSchema,
+    ChartPostSchema,
+    ChartPutSchema,
+    get_delete_ids_schema,
+    get_export_ids_schema,
+    get_fav_star_ids_schema,
+    openapi_spec_methods_override,
+    screenshot_query_schema,
+    thumbnail_query_schema,
+)
+from superset.commands.chart.create import CreateChartCommand
+from superset.commands.chart.delete import DeleteChartCommand
+from superset.commands.chart.exceptions import (
+    ChartAccessDeniedError,
+    ChartCreateFailedError,
+    ChartDeleteFailedError,
+    ChartForbiddenError,
+    ChartInvalidError,
+    ChartNotFoundError,
+    ChartRestoreFailedError,
+    ChartUpdateFailedError,
+    DashboardsForbiddenError,
+)
+from superset.commands.chart.export import ExportChartsCommand
+from superset.commands.chart.fave import AddFavoriteChartCommand
+from superset.commands.chart.importers.dispatcher import ImportChartsCommand
+from superset.commands.chart.restore import RestoreChartCommand
+from superset.commands.chart.unfave import DelFavoriteChartCommand
+from superset.commands.chart.update import UpdateChartCommand
+from superset.commands.chart.warm_up_cache import ChartWarmUpCacheCommand
+from superset.commands.exceptions import CommandException, TagForbiddenError
+from superset.commands.importers.exceptions import (
+    IncorrectFormatError,
+    NoValidFilesFoundError,
+)
+from superset.commands.importers.v1.utils import get_contents_from_bundle
+from superset.commands.purge import PurgeArchivedCommand, SoftDeleteBinding
+from superset.constants import MODEL_API_RW_METHOD_PERMISSION_MAP, RouteMethod
+from superset.daos.chart import ChartDAO
+from superset.exceptions import (
+    ScreenshotImageNotAvailableException,
+)
+from superset.extensions import event_logger, security_manager
+from superset.models.slice import Slice
+from superset.security.manager import get_extra_editor_subject_ids
+from superset.subjects.filters import (
+    FilterRelatedSubjects,
+    subject_type_filter,
+)
+from superset.tasks.thumbnails import cache_chart_thumbnail
+from superset.tasks.utils import get_current_user
+from superset.utils import json
+from superset.utils.core import sanitize_cookie_token
+from superset.utils.screenshots import (
+    ChartScreenshot,
+    DEFAULT_CHART_WINDOW_SIZE,
+    ScreenshotCachePayload,
+    StatusValues,
+)
+from superset.utils.urls import get_url_path
+from superset.versioning.api_helpers import (
+    current_entity_etag_uuid,
+    current_entity_version_info,
+    get_version_endpoint,
+    list_versions_endpoint,
+    restore_version_endpoint,
+)
+from superset.versioning.etag import set_version_etag
+from superset.versioning.schemas import VersionListItemSchema
+from superset.views.base_api import (
+    BaseSupersetModelRestApi,
+    RelatedFieldFilter,
+    requires_form_data,
+    requires_json,
+    statsd_metrics,
+)
+from superset.views.filters import (
+    BaseFilterRelatedUsers,
+    FilterRelatedUsers,
+    SoftDeleteApiMixin,
+)
+
+logger = logging.getLogger(__name__)
+
+_CHART_PURGE_BINDING = SoftDeleteBinding(
+    dao=ChartDAO,
+    not_found=ChartNotFoundError,
+    forbidden=ChartForbiddenError,
+    delete_failed=ChartDeleteFailedError,
+)
+
+
+class ChartRestApi(SoftDeleteApiMixin, BaseSupersetModelRestApi):
+    datamodel = SQLAInterface(Slice)
+
+    resource_name = "chart"
+    allow_browser_login = True
+
+    @before_request(only=["thumbnail", "screenshot", "cache_screenshot"])
+    def ensure_thumbnails_enabled(self) -> Optional[Response]:
+        if not is_feature_enabled("THUMBNAILS"):
+            return self.response_404()
+        return None
+
+    include_route_methods = RouteMethod.REST_MODEL_VIEW_CRUD_SET | {
+        RouteMethod.EXPORT,
+        RouteMethod.IMPORT,
+        RouteMethod.RELATED,
+        "bulk_delete",  # not using RouteMethod since locally defined
+        "restore",
+        "purge",
+        "viz_types",
+        "deck_layers",
+        "favorite_status",
+        "add_favorite",
+        "remove_favorite",
+        "thumbnail",
+        "screenshot",
+        "cache_screenshot",
+        "warm_up_cache",
+        "list_versions",
+        "get_version",
+        "activity",
+        "restore_version",
+    }
+    class_permission_name = "Chart"
+    # Custom methods (``restore``) need an explicit entry; FAB's @protect()
+    # decorator falls back to ``can_<method>_<class>`` (i.e.
+    # ``can_restore_Chart``) when the mapping is missing, which standard
+    # roles don't carry. Mirrors the permission model documented for
+    # ``DELETE`` / ``bulk_delete``: endpoint-level ``can_write`` plus
+    # resource-level ``raise_for_ownership``. See themes/api.py for the
+    # established pattern.
+    method_permission_name = {
+        **MODEL_API_RW_METHOD_PERMISSION_MAP,
+        "restore": "write",
+        "restore_version": "write",
+        "purge": "write",
+        # Reuses the same "can_read on Chart" permission as ``get``, so any
+        # principal (including an embedded guest) who can already fetch a
+        # single chart's metadata can resolve a Multiple Layers container's
+        # declared layers too.
+        "deck_layers": "read",
+    }
+
+    list_columns = [
+        "is_managed_externally",
+        "certified_by",
+        "certification_details",
+        "cache_timeout",
+        "changed_by.first_name",
+        "changed_by.last_name",
+        "changed_by.id",
+        "changed_by_name",
+        "changed_on_delta_humanized",
+        "changed_on_dttm",
+        "changed_on_utc",
+        "created_by.first_name",
+        "created_by.id",
+        "created_by.last_name",
+        "created_by_name",
+        "created_on_delta_humanized",
+        "datasource_id",
+        "datasource_name_text",
+        "datasource_type",
+        "datasource_url",
+        "description",
+        "description_markeddown",
+        "edit_url",
+        "form_data",
+        "id",
+        "last_saved_at",
+        "last_saved_by.id",
+        "last_saved_by.first_name",
+        "last_saved_by.last_name",
+        "editors.id",
+        "editors.label",
+        "editors.type",
+        "viewers.id",
+        "viewers.label",
+        "viewers.type",
+        "dashboards.id",
+        "dashboards.dashboard_title",
+        "params",
+        "slice_name",
+        "slice_url",
+        "table.default_endpoint",
+        "table.table_name",
+        "thumbnail_url",
+        "url",
+        "viz_type",
+        "tags.id",
+        "tags.name",
+        "tags.type",
+        "uuid",
+    ]
+    list_select_columns = list_columns + ["changed_by_fk", "changed_on"]
+    order_columns = [
+        "changed_by.first_name",
+        "changed_on_delta_humanized",
+        "datasource_id",
+        "datasource_name",
+        # Exposed so the Recently-Deleted view can sort archived charts by
+        # deletion time (sc-111760).
+        "deleted_at",
+        "last_saved_at",
+        "last_saved_by.id",
+        "last_saved_by.first_name",
+        "last_saved_by.last_name",
+        "slice_name",
+        "viz_type",
+    ]
+    search_columns = [
+        "created_by",
+        "changed_by",
+        "last_saved_at",
+        "last_saved_by",
+        "datasource_id",
+        "datasource_name",
+        "datasource_type",
+        # Exposed so the Recently-Deleted view can filter archived charts by a
+        # deletion-time cutoff (e.g. ``deleted_at`` ``gt`` cutoff) — sc-111760.
+        "deleted_at",
+        "description",
+        "id",
+        "uuid",
+        "editors",
+        "dashboards",
+        "slice_name",
+        "viz_type",
+        "tags",
+        "uuid",
+    ]
+    base_order = ("changed_on", "desc")
+    base_filters = [["id", ChartFilter, lambda: []]]
+    search_filters = {
+        "deleted_at": [ChartDeletedRecencyFilter],
+        "id": [
+            ChartFavoriteFilter,
+            ChartCertifiedFilter,
+            ChartEditableFilter,
+            ChartDeletedStateFilter,
+            ChartOwnedCreatedFavoredByMeFilter,
+        ],
+        "slice_name": [ChartAllTextFilter],
+        "created_by": [ChartHasCreatedByFilter, ChartCreatedByMeFilter],
+        "tags": [ChartTagNameFilter, ChartTagIdFilter],
+    }
+    # Will just affect _info endpoint
+    edit_columns = ["slice_name"]
+    add_columns = edit_columns
+
+    add_model_schema = ChartPostSchema()
+    edit_model_schema = ChartPutSchema()
+    chart_get_response_schema = ChartGetResponseSchema()
+
+    openapi_spec_tag = "Charts"
+    """ Override the name set for this collection of endpoints """
+    openapi_spec_component_schemas = CHART_SCHEMAS + (VersionListItemSchema,)
+
+    apispec_parameter_schemas = {
+        "screenshot_query_schema": screenshot_query_schema,
+        "get_delete_ids_schema": get_delete_ids_schema,
+        "get_export_ids_schema": get_export_ids_schema,
+        "get_fav_star_ids_schema": get_fav_star_ids_schema,
+    }
+    """ Add extra schemas to the OpenAPI components schema section """
+    openapi_spec_methods = openapi_spec_methods_override
+    """ Overrides GET methods OpenApi descriptions """
+
+    order_rel_fields = {
+        "slices": ("slice_name", "asc"),
+        "editors": ("label", "asc"),
+        "viewers": ("label", "asc"),
+    }
+    text_field_rel_fields = {
+        "editors": "label",
+        "viewers": "label",
+    }
+    base_related_field_filters = {
+        "created_by": [["id", BaseFilterRelatedUsers, lambda: []]],
+        "changed_by": [["id", BaseFilterRelatedUsers, lambda: []]],
+        "editors": [
+            ["type", subject_type_filter("SUBJECTS_RELATED_TYPES_CHARTS"), lambda: []]
+        ],
+        "viewers": [
+            ["type", subject_type_filter("SUBJECTS_RELATED_TYPES_CHARTS"), lambda: []]
+        ],
+    }
+    related_field_filters = {
+        "created_by": RelatedFieldFilter("first_name", FilterRelatedUsers),
+        "changed_by": RelatedFieldFilter("first_name", FilterRelatedUsers),
+        "editors": RelatedFieldFilter("label", FilterRelatedSubjects),
+        "viewers": RelatedFieldFilter("label", FilterRelatedSubjects),
+    }
+
+    allowed_rel_fields = {
+        "created_by",
+        "changed_by",
+        "editors",
+        "viewers",
+    }
+    extra_fields_rel_fields = {
+        "editors": ["type", "active", "secondary_label", "img"],
+        "viewers": ["type", "active", "secondary_label", "img"],
+    }
+
+    @expose("/<id_or_uuid>", methods=["GET"])
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.get",
+        log_to_statsd=False,
+    )
+    def get(self, id_or_uuid: str) -> Response:
+        """Gets a chart
+        ---
+        get:
+          description: >-
+            Get a chart
+          parameters:
+          - in: path
+            schema:
+              type: string
+            name: id_or_uuid
+            description: Either the id of the chart, or its uuid
+          responses:
+            200:
+              description: Chart
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      result:
+                        $ref: '#/components/schemas/ChartGetResponseSchema'
+            302:
+              description: Redirects to the current digest
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            404:
+              $ref: '#/components/responses/404'
+        """
+        # pylint: disable=arguments-differ
+        try:
+            dash = ChartDAO.get_by_id_or_uuid(id_or_uuid)
+            result = self.chart_get_response_schema.dump(dash)
+            if resolver := current_app.config.get("EXTRA_OWNERS_RESOLVER"):
+                result["extra_owners"] = resolver(dash)
+            if current_app.config.get("EXTRA_EDITORS_RESOLVER"):
+                result["extra_editors"] = get_extra_editor_subject_ids(dash)
+
+            return set_version_etag(
+                self.response(200, result=result),
+                current_entity_etag_uuid(Slice, dash.id, dash.uuid),
+            )
+        except ChartNotFoundError:
+            return self.response_404()
+
+    @expose("/<pk>/deck_layers/", methods=("GET",))
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: (f"{self.__class__.__name__}.deck_layers"),
+        log_to_statsd=False,
+    )
+    def deck_layers(self, pk: int) -> Response:
+        """Gets the sub-layer charts declared by a deck.gl Multiple Layers chart
+        ---
+        get:
+          summary: >-
+            Get the sub-layer charts declared by a deck.gl Multiple Layers chart
+          description: >-
+            Multiple Layers charts (viz_type "deck_multi") reference other
+            saved charts as layers via their `deck_slices` config, but those
+            layer charts typically sit on no dashboard of their own, so a
+            per-layer `GET /api/v1/chart/<id>` can 404 for a principal
+            (e.g. an embedded guest) who is only entitled to the container.
+            This endpoint gates on the container chart and resolves the
+            layers it declares, mirroring the access the legacy explore_json
+            pipeline granted server-side.
+          parameters:
+          - in: path
+            schema:
+              type: integer
+            name: pk
+            description: The id of the Multiple Layers container chart
+          responses:
+            200:
+              description: The container's declared layer charts
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      result:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            slice_id:
+                              type: integer
+                            viz_type:
+                              type: string
+                            params:
+                              type: string
+                            datasource_id:
+                              type: integer
+                            datasource_type:
+                              type: string
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            404:
+              $ref: '#/components/responses/404'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        try:
+            container = ChartDAO.get_by_id_or_uuid(str(pk))
+        except ChartNotFoundError:
+            return self.response_404()
+
+        try:
+            container_params = json.loads(container.params or "{}")
+        except (TypeError, ValueError):
+            container_params = {}
+
+        deck_slice_ids = [
+            slice_id
+            for slice_id in container_params.get("deck_slices", [])
+            if isinstance(slice_id, int)
+        ]
+        if not deck_slice_ids:
+            return self.response(200, result=[])
+
+        # The container's own access has already been checked above. Layer
+        # charts sit on no dashboard of their own, so for an embedded guest
+        # (the intended use case, mirroring what the legacy explore_json
+        # pipeline granted server-side) they are resolved without the base
+        # filter. An ordinary logged-in principal is not entitled to read an
+        # arbitrary chart's params/datasource just by naming it in a
+        # container they can edit, so the base filter still applies to them:
+        # a referenced layer they can't otherwise read is silently omitted
+        # below rather than leaked.
+        layers = ChartDAO.find_by_ids(
+            deck_slice_ids, skip_base_filter=security_manager.is_guest_user()
+        )
+        layers_by_id = {layer.id: layer for layer in layers}
+        result = [
+            {
+                "slice_id": slice_id,
+                "viz_type": layers_by_id[slice_id].viz_type,
+                "params": layers_by_id[slice_id].params,
+                "datasource_id": layers_by_id[slice_id].datasource_id,
+                "datasource_type": layers_by_id[slice_id].datasource_type,
+            }
+            for slice_id in deck_slice_ids
+            if slice_id in layers_by_id
+        ]
+        return self.response(200, result=result)
+
+    @expose("/", methods=("POST",))
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.post",
+        log_to_statsd=False,
+    )
+    @requires_json
+    def post(self) -> Response:
+        """Create a new chart.
+        ---
+        post:
+          summary: Create a new chart
+          requestBody:
+            description: Chart schema
+            required: true
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/{{self.__class__.__name__}}.post'
+          responses:
+            201:
+              description: Chart added
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      id:
+                        type: number
+                      result:
+                        $ref: '#/components/schemas/{{self.__class__.__name__}}.post'
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            403:
+              $ref: '#/components/responses/403'
+            422:
+              $ref: '#/components/responses/422'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        try:
+            item = self.add_model_schema.load(request.json)
+        # This validates custom Schema with custom validations
+        except ValidationError as error:
+            return self.response_400(message=error.messages)
+        try:
+            new_model = CreateChartCommand(item).run()
+            return self.response(201, id=new_model.id, result=item, uuid=new_model.uuid)
+        except DashboardsForbiddenError as ex:
+            return self.response(ex.status, message=ex.message)
+        except ChartInvalidError as ex:
+            return self.response_422(message=ex.normalized_messages())
+        except ChartCreateFailedError as ex:
+            logger.error(
+                "Error creating model %s: %s",
+                self.__class__.__name__,
+                str(ex),
+                exc_info=True,
+            )
+            return self.response_422(message=str(ex))
+
+    @expose("/<pk>", methods=("PUT",))
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.put",
+        log_to_statsd=False,
+    )
+    @requires_json
+    def put(self, pk: int) -> Response:
+        """Update a chart.
+        ---
+        put:
+          summary: Update a chart
+          parameters:
+          - in: path
+            schema:
+              type: integer
+            name: pk
+          requestBody:
+            description: Chart schema
+            required: true
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/{{self.__class__.__name__}}.put'
+          responses:
+            200:
+              description: Chart changed
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      id:
+                        type: number
+                      result:
+                        $ref: '#/components/schemas/{{self.__class__.__name__}}.put'
+                      old_version:
+                        type: integer
+                        nullable: true
+                        description: >-
+                          0-based version_number of the live row before this
+                          update. Unstable under retention pruning — see
+                          old_transaction_id for a stable identifier.
+                      new_version:
+                        type: integer
+                        nullable: true
+                        description: >-
+                          0-based version_number of the newly-live row after
+                          this update. Can equal old_version when no
+                          versioned column changed, or when retention
+                          pruning dropped an older closed row in the same
+                          commit.
+                      old_transaction_id:
+                        type: integer
+                        nullable: true
+                        description: Continuum transaction_id of the live
+                          row before this update. Stable across pruning.
+                      new_transaction_id:
+                        type: integer
+                        nullable: true
+                        description: Continuum transaction_id of the live
+                          row after this update. Differs from
+                          old_transaction_id when the update produced a new
+                          version row.
+                      old_version_uuid:
+                        type: string
+                        format: uuid
+                        nullable: true
+                        description: Deterministic version_uuid of the live
+                          row before this update. Null when version capture
+                          is disabled or the entity has no version rows yet.
+                      new_version_uuid:
+                        type: string
+                        format: uuid
+                        nullable: true
+                        description: Deterministic version_uuid of the live
+                          row after this update. Null when version capture
+                          is disabled.
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            403:
+              $ref: '#/components/responses/403'
+            404:
+              $ref: '#/components/responses/404'
+            422:
+              $ref: '#/components/responses/422'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        try:
+            item = self.edit_model_schema.load(request.json)
+        # This validates custom Schema with custom validations
+        except ValidationError as error:
+            return self.response_400(message=error.messages)
+
+        # Live version identifiers before the update (empty + query-free when
+        # ``ENABLE_VERSIONING_CAPTURE`` is off, so this stays inert under the
+        # kill-switch).
+        old_info = current_entity_version_info(Slice, pk)
+
+        try:
+            changed_model = UpdateChartCommand(pk, item).run()
+            new_info = current_entity_version_info(
+                Slice, changed_model.id, changed_model.uuid
+            )
+            response = self.response(
+                200,
+                id=changed_model.id,
+                result=item,
+                old_version=old_info.version,
+                new_version=new_info.version,
+                old_transaction_id=old_info.transaction_id,
+                new_transaction_id=new_info.transaction_id,
+                old_version_uuid=old_info.version_uuid,
+                new_version_uuid=new_info.version_uuid,
+            )
+            set_version_etag(response, new_info.version_uuid)
+        except ChartNotFoundError:
+            response = self.response_404()
+        except ChartForbiddenError:
+            response = self.response_403()
+        except DashboardsForbiddenError as ex:
+            response = self.response(ex.status, message=ex.message)
+        except TagForbiddenError as ex:
+            response = self.response(403, message=str(ex))
+        except ChartInvalidError as ex:
+            response = self.response_422(message=ex.normalized_messages())
+        except ChartUpdateFailedError as ex:
+            logger.error(
+                "Error updating model %s: %s",
+                self.__class__.__name__,
+                str(ex),
+                exc_info=True,
+            )
+            response = self.response_422(message=str(ex))
+
+        return response
+
+    @expose("/<pk>", methods=("DELETE",))
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.delete",
+        log_to_statsd=False,
+    )
+    def delete(self, pk: int) -> Response:
+        """Delete a chart.
+
+        When the ``SOFT_DELETE`` feature flag is enabled, marks the chart as
+        deleted (sets ``deleted_at``) and hides it from list/detail endpoints
+        and relationship loads; the row is preserved and recoverable via
+        ``POST /api/v1/chart/<uuid>/restore`` by an owner or admin. With the
+        flag disabled (the default), the chart is permanently hard-deleted
+        and is not recoverable.
+        ---
+        delete:
+          summary: Delete a chart (soft delete, recoverable via restore, when
+            the SOFT_DELETE feature flag is enabled; permanent otherwise)
+          parameters:
+          - in: path
+            schema:
+              type: integer
+            name: pk
+          responses:
+            200:
+              description: Chart delete
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      message:
+                        type: string
+            401:
+              $ref: '#/components/responses/401'
+            403:
+              $ref: '#/components/responses/403'
+            404:
+              $ref: '#/components/responses/404'
+            422:
+              $ref: '#/components/responses/422'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        try:
+            DeleteChartCommand([pk]).run()
+            return self.response(200, message="OK")
+        except ChartNotFoundError:
+            return self.response_404()
+        except ChartForbiddenError:
+            return self.response_403()
+        except ChartDeleteFailedError as ex:
+            logger.error(
+                "Error deleting model %s: %s",
+                self.__class__.__name__,
+                str(ex),
+                exc_info=True,
+            )
+            return self.response_422(message=str(ex))
+
+    @expose("/", methods=("DELETE",))
+    @protect()
+    @safe
+    @statsd_metrics
+    @parse_rison(get_delete_ids_schema)
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.bulk_delete",
+        log_to_statsd=False,
+    )
+    def bulk_delete(self, **kwargs: Any) -> Response:
+        """Bulk delete charts.
+
+        When the ``SOFT_DELETE`` feature flag is enabled, marks each chart as
+        deleted (sets ``deleted_at``) and hides it from list/detail endpoints
+        and relationship loads; rows are preserved and recoverable via
+        ``POST /api/v1/chart/<uuid>/restore`` by an owner or admin. With the
+        flag disabled (the default), the charts are permanently hard-deleted
+        and are not recoverable.
+        ---
+        delete:
+          summary: Bulk delete charts (soft delete, recoverable via restore,
+            when the SOFT_DELETE feature flag is enabled; permanent otherwise)
+          parameters:
+          - in: query
+            name: q
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/get_delete_ids_schema'
+          responses:
+            200:
+              description: Charts bulk delete
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      message:
+                        type: string
+            401:
+              $ref: '#/components/responses/401'
+            403:
+              $ref: '#/components/responses/403'
+            404:
+              $ref: '#/components/responses/404'
+            422:
+              $ref: '#/components/responses/422'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        item_ids = kwargs["rison"]
+        try:
+            DeleteChartCommand(item_ids).run()
+            return self.response(
+                200,
+                message=ngettext(
+                    "Deleted %(num)d chart", "Deleted %(num)d charts", num=len(item_ids)
+                ),
+            )
+        except ChartNotFoundError:
+            return self.response_404()
+        except ChartForbiddenError:
+            return self.response_403()
+        except ChartDeleteFailedError as ex:
+            return self.response_422(message=str(ex))
+
+    @expose("/<uuid>/restore", methods=("POST",))
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.restore",
+        log_to_statsd=False,
+    )
+    def restore(self, uuid: str) -> Response:
+        """Restore a soft-deleted chart.
+        ---
+        post:
+          summary: Restore a soft-deleted chart
+          parameters:
+          - in: path
+            schema:
+              type: string
+              format: uuid
+            name: uuid
+          responses:
+            200:
+              description: Chart restored
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      message:
+                        type: string
+            401:
+              $ref: '#/components/responses/401'
+            403:
+              $ref: '#/components/responses/403'
+            404:
+              $ref: '#/components/responses/404'
+            422:
+              $ref: '#/components/responses/422'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        try:
+            RestoreChartCommand(uuid).run()
+            return self.response(200, message="OK")
+        except ChartNotFoundError:
+            return self.response_404()
+        except ChartForbiddenError:
+            return self.response_403()
+        except ChartRestoreFailedError as ex:
+            logger.error(
+                "Error restoring model %s: %s",
+                self.__class__.__name__,
+                str(ex),
+                exc_info=True,
+            )
+            return self.response_422(message=str(ex))
+
+    @expose("/<uuid>/purge", methods=("POST",))
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.purge",
+        log_to_statsd=False,
+    )
+    def purge(self, uuid: str) -> Response:
+        """Permanently delete a soft-deleted (archived) chart.
+        ---
+        post:
+          summary: Permanently delete a soft-deleted chart
+          description: >-
+            Irreversibly remove an archived chart and its dependents. Limited to
+            owners and admins (same audience as restore).
+          parameters:
+          - in: path
+            schema:
+              type: string
+              format: uuid
+            name: uuid
+          responses:
+            200:
+              description: Chart permanently deleted
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      message:
+                        type: string
+            401:
+              $ref: '#/components/responses/401'
+            403:
+              $ref: '#/components/responses/403'
+            404:
+              $ref: '#/components/responses/404'
+            422:
+              $ref: '#/components/responses/422'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        try:
+            PurgeArchivedCommand(uuid, _CHART_PURGE_BINDING).run()
+            return self.response(200, message="OK")
+        except ChartNotFoundError:
+            return self.response_404()
+        except ChartForbiddenError:
+            return self.response_403()
+        except ChartDeleteFailedError as ex:
+            logger.error(
+                "Error purging model %s: %s",
+                self.__class__.__name__,
+                str(ex),
+                exc_info=True,
+            )
+            return self.response_422(message=str(ex))
+
+    @expose("/<pk>/cache_screenshot/", methods=("GET",))
+    @protect()
+    @parse_rison(screenshot_query_schema)
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: (
+            f"{self.__class__.__name__}.cache_screenshot"
+        ),
+        log_to_statsd=False,
+    )
+    def cache_screenshot(self, pk: int, **kwargs: Any) -> WerkzeugResponse:
+        """Compute and cache a screenshot.
+        ---
+        get:
+          summary: Compute and cache a screenshot
+          parameters:
+          - in: path
+            schema:
+              type: integer
+            name: pk
+          - in: query
+            name: q
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/screenshot_query_schema'
+          responses:
+            200:
+                description: Chart async result
+                content:
+                  application/json:
+                    schema:
+                      $ref: "#/components/schemas/ChartCacheScreenshotResponseSchema"
+            202:
+              description: Chart screenshot task created
+              content:
+                application/json:
+                  schema:
+                    $ref: "#/components/schemas/ChartCacheScreenshotResponseSchema"
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            404:
+              $ref: '#/components/responses/404'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        if is_feature_enabled(
+            "GRANULAR_EXPORT_CONTROLS"
+        ) and not security_manager.can_access("can_export_image", "Superset"):
+            return self.response_403()
+        rison_dict = kwargs["rison"]
+        force = rison_dict.get("force")
+        window_size = rison_dict.get("window_size") or DEFAULT_CHART_WINDOW_SIZE
+
+        # Don't shrink the image if thumb_size is not specified
+        thumb_size = rison_dict.get("thumb_size") or window_size
+
+        chart = cast(Slice, self.datamodel.get(pk, self._base_filters))
+        if not chart:
+            return self.response_404()
+
+        chart_url = get_url_path("Superset.slice", slice_id=chart.id)
+        screenshot_obj = ChartScreenshot(chart_url, chart.digest)
+        cache_key = screenshot_obj.get_cache_key(window_size, thumb_size)
+        cache_payload = (
+            screenshot_obj.get_from_cache_key(cache_key) or ScreenshotCachePayload()
+        )
+        image_url = get_url_path(
+            "ChartRestApi.screenshot", pk=chart.id, digest=cache_key
+        )
+
+        def build_response(status_code: int) -> WerkzeugResponse:
+            return self.response(
+                status_code,
+                cache_key=cache_key,
+                chart_url=chart_url,
+                image_url=image_url,
+                task_updated_at=cache_payload.get_timestamp(),
+                task_status=cache_payload.get_status(),
+            )
+
+        if cache_payload.should_trigger_task(force):
+            logger.info("Triggering screenshot ASYNC")
+            screenshot_obj.cache.set(cache_key, ScreenshotCachePayload().to_dict())
+            cache_chart_thumbnail.delay(
+                current_user=get_current_user(),
+                chart_id=chart.id,
+                window_size=window_size,
+                thumb_size=thumb_size,
+                force=force,
+            )
+            return build_response(202)
+        return build_response(200)
+
+    @expose("/<pk>/screenshot/<digest>/", methods=("GET",))
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.screenshot",
+        log_to_statsd=False,
+    )
+    def screenshot(self, pk: int, digest: str) -> WerkzeugResponse:
+        """Get a computed screenshot from cache.
+        ---
+        get:
+          summary: Get a computed screenshot from cache
+          parameters:
+          - in: path
+            schema:
+              type: integer
+            name: pk
+          - in: path
+            schema:
+              type: string
+            name: digest
+          responses:
+            200:
+              description: Chart screenshot image
+              content:
+               image/*:
+                 schema:
+                   type: string
+                   format: binary
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            404:
+              $ref: '#/components/responses/404'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        if is_feature_enabled(
+            "GRANULAR_EXPORT_CONTROLS"
+        ) and not security_manager.can_access("can_export_image", "Superset"):
+            return self.response_403()
+        chart = self.datamodel.get(pk, self._base_filters)
+
+        if not chart:
+            return self.response_404()
+
+        if cache_payload := ChartScreenshot.get_from_cache_key(digest):
+            if cache_payload.status == StatusValues.UPDATED:
+                try:
+                    image = cache_payload.get_image()
+                except ScreenshotImageNotAvailableException:
+                    return self.response_404()
+                return Response(
+                    FileWrapper(image),
+                    mimetype="image/png",
+                    direct_passthrough=True,
+                )
+        return self.response_404()
+
+    @expose("/<pk>/thumbnail/<digest>/", methods=("GET",))
+    @protect()
+    @parse_rison(thumbnail_query_schema)
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.thumbnail",
+        log_to_statsd=False,
+    )
+    def thumbnail(self, pk: int, digest: str, **kwargs: Any) -> WerkzeugResponse:
+        """Compute or get already computed chart thumbnail from cache.
+        ---
+        get:
+          summary: Get chart thumbnail
+          description: Compute or get already computed chart thumbnail from cache.
+          parameters:
+          - in: path
+            schema:
+              type: integer
+            name: pk
+          - in: path
+            name: digest
+            description: A hex digest that makes this chart unique
+            schema:
+              type: string
+          responses:
+            200:
+              description: Chart thumbnail image
+              content:
+               image/*:
+                 schema:
+                   type: string
+                   format: binary
+            302:
+              description: Redirects to the current digest
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            404:
+              $ref: '#/components/responses/404'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        if is_feature_enabled(
+            "GRANULAR_EXPORT_CONTROLS"
+        ) and not security_manager.can_access("can_export_image", "Superset"):
+            return self.response_403()
+        chart = cast(Slice, self.datamodel.get(pk, self._base_filters))
+        if not chart:
+            return self.response_404()
+
+        current_user = get_current_user()
+        if chart.digest != digest:
+            self.incr_stats("redirect", self.thumbnail.__name__)
+            return redirect(
+                url_for(
+                    f"{self.__class__.__name__}.thumbnail", pk=pk, digest=chart.digest
+                )
+            )
+        url = get_url_path("Superset.slice", slice_id=chart.id)
+        screenshot_obj = ChartScreenshot(url, chart.digest)
+        cache_key = screenshot_obj.get_cache_key()
+        cache_payload = (
+            screenshot_obj.get_from_cache_key(cache_key) or ScreenshotCachePayload()
+        )
+
+        if cache_payload.should_trigger_task():
+            self.incr_stats("async", self.thumbnail.__name__)
+            logger.info(
+                "Triggering thumbnail compute (chart id: %s) ASYNC", str(chart.id)
+            )
+            screenshot_obj.cache.set(cache_key, ScreenshotCachePayload().to_dict())
+            cache_chart_thumbnail.delay(
+                current_user=current_user,
+                chart_id=chart.id,
+                force=False,
+            )
+            return self.response(
+                202,
+                task_updated_at=cache_payload.get_timestamp(),
+                task_status=cache_payload.get_status(),
+            )
+        self.incr_stats("from_cache", self.thumbnail.__name__)
+        try:
+            image = cache_payload.get_image()
+        except ScreenshotImageNotAvailableException:
+            return self.response_404()
+        return Response(
+            FileWrapper(image),
+            mimetype="image/png",
+            direct_passthrough=True,
+        )
+
+    @expose("/export/", methods=("GET",))
+    @protect()
+    @safe
+    @statsd_metrics
+    @parse_rison(get_export_ids_schema)
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.export",
+        log_to_statsd=False,
+    )
+    def export(self, **kwargs: Any) -> Response:
+        """Download multiple charts as YAML files.
+        ---
+        get:
+          summary: Download multiple charts as YAML files
+          parameters:
+          - in: query
+            name: q
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/get_export_ids_schema'
+          responses:
+            200:
+              description: A zip file with chart(s), dataset(s) and database(s) as YAML
+              content:
+                application/zip:
+                  schema:
+                    type: string
+                    format: binary
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            404:
+              $ref: '#/components/responses/404'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        requested_ids = kwargs["rison"]
+        timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        root = f"chart_export_{timestamp}"
+        filename = f"{root}.zip"
+
+        buf = BytesIO()
+        with ZipFile(buf, "w") as bundle:
+            try:
+                for file_name, file_content in ExportChartsCommand(requested_ids).run():
+                    with bundle.open(f"{root}/{file_name}", "w") as fp:
+                        fp.write(file_content().encode())
+            except ChartNotFoundError:
+                return self.response_404()
+        buf.seek(0)
+
+        response = send_file(
+            buf,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=filename,
+        )
+        if token := sanitize_cookie_token(request.args.get("token")):
+            response.set_cookie(token, "done", max_age=600)
+        return response
+
+    @expose("/favorite_status/", methods=("GET",))
+    @protect()
+    @safe
+    @parse_rison(get_fav_star_ids_schema)
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: (
+            f"{self.__class__.__name__}.favorite_status"
+        ),
+        log_to_statsd=False,
+    )
+    def favorite_status(self, **kwargs: Any) -> Response:
+        """Check favorited charts for current user.
+        ---
+        get:
+          summary: Check favorited charts for current user
+          parameters:
+          - in: query
+            name: q
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/get_fav_star_ids_schema'
+          responses:
+            200:
+              description:
+              content:
+                application/json:
+                  schema:
+                    $ref: "#/components/schemas/GetFavStarIdsSchema"
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            404:
+              $ref: '#/components/responses/404'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        requested_ids = kwargs["rison"]
+        charts = ChartDAO.find_by_ids(requested_ids)
+        if not charts:
+            return self.response_404()
+        favorited_chart_ids = ChartDAO.favorited_ids(charts)
+        res = [
+            {"id": request_id, "value": request_id in favorited_chart_ids}
+            for request_id in requested_ids
+        ]
+        return self.response(200, result=res)
+
+    @expose("/<pk>/favorites/", methods=("POST",))
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.add_favorite",
+        log_to_statsd=False,
+    )
+    def add_favorite(self, pk: int) -> Response:
+        """Mark the chart as favorite for the current user.
+        ---
+        post:
+          summary: Mark the chart as favorite for the current user
+          parameters:
+          - in: path
+            schema:
+              type: integer
+            name: pk
+          responses:
+            200:
+              description: Chart added to favorites
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      result:
+                        type: object
+            401:
+              $ref: '#/components/responses/401'
+            404:
+              $ref: '#/components/responses/404'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        try:
+            AddFavoriteChartCommand(pk).run()
+        except ChartNotFoundError:
+            return self.response_404()
+        except (ChartAccessDeniedError, ChartForbiddenError):
+            return self.response_403()
+
+        return self.response(200, result="OK")
+
+    @expose("/<pk>/favorites/", methods=("DELETE",))
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: (
+            f"{self.__class__.__name__}.remove_favorite"
+        ),
+        log_to_statsd=False,
+    )
+    def remove_favorite(self, pk: int) -> Response:
+        """Remove the chart from the user favorite list.
+        ---
+        delete:
+          summary: Remove the chart from the user favorite list
+          parameters:
+          - in: path
+            schema:
+              type: integer
+            name: pk
+          responses:
+            200:
+              description: Chart removed from favorites
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      result:
+                        type: object
+            401:
+              $ref: '#/components/responses/401'
+            404:
+              $ref: '#/components/responses/404'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        try:
+            DelFavoriteChartCommand(pk).run()
+        except ChartNotFoundError:
+            return self.response_404()
+        except (ChartAccessDeniedError, ChartForbiddenError):
+            return self.response_403()
+
+        return self.response(200, result="OK")
+
+    def _pre_related_check(self, column_name: str) -> Optional[Response]:
+        """Restrict the editors related field to users with write access."""
+        if (
+            column_name == "editors"
+            and not security_manager.can_access_all_datasources()
+        ):
+            return self.response_403()
+        return None
+
+    @expose("/warm_up_cache", methods=("PUT",))
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.warm_up_cache",
+        log_to_statsd=False,
+    )
+    def warm_up_cache(self) -> Response:
+        """Warm up the cache for the chart.
+        ---
+        put:
+          summary: Warm up the cache for the chart
+          description: >-
+            Warms up the cache for the chart.
+            Note for slices a force refresh occurs.
+            In terms of the `extra_filters` these can be obtained from records in the JSON
+            encoded `logs.json` column associated with the `explore` action.
+          requestBody:
+            description: >-
+              Identifies the chart to warm up cache for, and any additional dashboard or
+              filter context to use.
+            required: true
+            content:
+              application/json:
+                schema:
+                  $ref: "#/components/schemas/ChartCacheWarmUpRequestSchema"
+          responses:
+            200:
+              description: Each chart's warmup status
+              content:
+                application/json:
+                  schema:
+                    $ref: "#/components/schemas/ChartCacheWarmUpResponseSchema"
+            400:
+              $ref: '#/components/responses/400'
+            404:
+              $ref: '#/components/responses/404'
+            500:
+              $ref: '#/components/responses/500'
+        """  # noqa: E501
+        try:
+            body = ChartCacheWarmUpRequestSchema().load(request.json)
+        except ValidationError as error:
+            return self.response_400(message=error.messages)
+        try:
+            result = ChartWarmUpCacheCommand(
+                body["chart_id"],
+                body.get("dashboard_id"),
+                body.get("extra_filters"),
+            ).run()
+            return self.response(200, result=[result])
+        except CommandException as ex:
+            return self.response(ex.status, message=ex.message)
+
+    @expose("/import/", methods=("POST",))
+    @protect()
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.import_",
+        log_to_statsd=False,
+    )
+    @requires_form_data
+    def import_(self) -> Response:
+        """Import chart(s) with associated datasets and databases.
+
+        When the ``SOFT_DELETE`` feature flag is enabled and an imported
+        chart's UUID matches an existing **soft-deleted** chart, the import
+        restores that chart and applies the upload's contents — **even when
+        ``overwrite`` is not set**. Active charts keep the usual contract
+        (never mutated without ``overwrite=true``); a soft-deleted UUID match
+        is treated as an explicit request to bring the chart back. Requires
+        ``can_write`` and ownership of the deleted row (or admin). See
+        UPDATING.md for details.
+        ---
+        post:
+          summary: Import chart(s) with associated datasets and databases
+          requestBody:
+            required: true
+            content:
+              multipart/form-data:
+                schema:
+                  type: object
+                  properties:
+                    formData:
+                      description: upload file (ZIP)
+                      type: string
+                      format: binary
+                    passwords:
+                      description: >-
+                        JSON map of passwords for each featured database in the
+                        ZIP file. If the ZIP includes a database config in the path
+                        `databases/MyDatabase.yaml`, the password should be provided
+                        in the following format:
+                        `{"databases/MyDatabase.yaml": "my_password"}`.
+                      type: string
+                    overwrite:
+                      description: overwrite existing charts?
+                      type: boolean
+                    ssh_tunnel_passwords:
+                      description: >-
+                        JSON map of passwords for each ssh_tunnel associated to a
+                        featured database in the ZIP file. If the ZIP includes a
+                        ssh_tunnel config in the path `databases/MyDatabase.yaml`,
+                        the password should be provided in the following format:
+                        `{"databases/MyDatabase.yaml": "my_password"}`.
+                      type: string
+                    ssh_tunnel_private_keys:
+                      description: >-
+                        JSON map of private_keys for each ssh_tunnel associated to a
+                        featured database in the ZIP file. If the ZIP includes a
+                        ssh_tunnel config in the path `databases/MyDatabase.yaml`,
+                        the private_key should be provided in the following format:
+                        `{"databases/MyDatabase.yaml": "my_private_key"}`.
+                      type: string
+                    ssh_tunnel_private_key_passwords:
+                      description: >-
+                        JSON map of private_key_passwords for each ssh_tunnel associated
+                        to a featured database in the ZIP file. If the ZIP includes a
+                        ssh_tunnel config in the path `databases/MyDatabase.yaml`,
+                        the private_key should be provided in the following format:
+                        `{"databases/MyDatabase.yaml": "my_private_key_password"}`.
+                      type: string
+          responses:
+            200:
+              description: Chart import result
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      message:
+                        type: string
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            422:
+              $ref: '#/components/responses/422'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        upload = request.files.get("formData")
+        if not upload:
+            return self.response_400()
+        if not is_zipfile(upload):
+            raise IncorrectFormatError("Not a ZIP file")
+        with ZipFile(upload) as bundle:
+            contents = get_contents_from_bundle(bundle)
+
+        if not contents:
+            raise NoValidFilesFoundError()
+
+        passwords = (
+            json.loads(request.form["passwords"])
+            if "passwords" in request.form
+            else None
+        )
+        overwrite = request.form.get("overwrite") == "true"
+        ssh_tunnel_passwords = (
+            json.loads(request.form["ssh_tunnel_passwords"])
+            if "ssh_tunnel_passwords" in request.form
+            else None
+        )
+        ssh_tunnel_private_keys = (
+            json.loads(request.form["ssh_tunnel_private_keys"])
+            if "ssh_tunnel_private_keys" in request.form
+            else None
+        )
+        ssh_tunnel_priv_key_passwords = (
+            json.loads(request.form["ssh_tunnel_private_key_passwords"])
+            if "ssh_tunnel_private_key_passwords" in request.form
+            else None
+        )
+
+        command = ImportChartsCommand(
+            contents,
+            passwords=passwords,
+            overwrite=overwrite,
+            ssh_tunnel_passwords=ssh_tunnel_passwords,
+            ssh_tunnel_private_keys=ssh_tunnel_private_keys,
+            ssh_tunnel_priv_key_passwords=ssh_tunnel_priv_key_passwords,
+        )
+        command.run()
+        return self.response(200, message="OK")
+
+    @expose("/<uuid_str>/versions/", methods=("GET",))
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.list_versions",
+        log_to_statsd=False,
+    )
+    def list_versions(self, uuid_str: str) -> Response:
+        """List version history for a chart.
+        ---
+        get:
+          summary: Return the version history for a chart
+          parameters:
+          - in: path
+            schema:
+              type: string
+              format: uuid
+            name: uuid_str
+            description: Chart UUID
+          responses:
+            200:
+              description: Version history ordered by oldest first
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      result:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/VersionListItemSchema'
+                      count:
+                        type: integer
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            403:
+              $ref: '#/components/responses/403'
+            404:
+              $ref: '#/components/responses/404'
+        """
+        return list_versions_endpoint(self, Slice, uuid_str)
+
+    @expose(
+        "/<uuid_str>/versions/<version_uuid_str>/",
+        methods=("GET",),
+    )
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.get_version",  # noqa: E501
+        log_to_statsd=False,
+    )
+    def get_version(self, uuid_str: str, version_uuid_str: str) -> Response:
+        """Return the chart's state at a specific version.
+        ---
+        get:
+          summary: Read-only snapshot of the chart at a given version
+          parameters:
+          - in: path
+            schema:
+              type: string
+              format: uuid
+            name: uuid_str
+            description: Chart UUID
+          - in: path
+            schema:
+              type: string
+              format: uuid
+            name: version_uuid_str
+            description: Version UUID as returned by the list endpoint
+          responses:
+            200:
+              description: Snapshot of the chart at the target version
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      result:
+                        type: object
+                        description: >-
+                          The chart's scalar fields at the target version
+                          (entity-specific keys), plus a `_version` block
+                          with the version-level metadata.
+                        properties:
+                          _version:
+                            $ref: '#/components/schemas/VersionListItemSchema'
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            403:
+              $ref: '#/components/responses/403'
+            404:
+              $ref: '#/components/responses/404'
+        """
+        return get_version_endpoint(self, Slice, uuid_str, version_uuid_str)
+
+    @expose("/<uuid_str>/activity/", methods=("GET",))
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.activity",
+        log_to_statsd=False,
+    )
+    def activity(self, uuid_str: str) -> Response:
+        """Return the cross-entity activity stream for a chart.
+        ---
+        get:
+          summary: Activity stream — chart own edits + datasets the
+            chart pointed at during association
+          parameters:
+          - in: path
+            schema:
+              type: string
+              format: uuid
+            name: uuid_str
+            description: Chart UUID
+          - in: query
+            schema:
+              type: string
+              format: date-time
+            name: since
+          - in: query
+            schema:
+              type: string
+              format: date-time
+            name: until
+          - in: query
+            schema:
+              type: string
+              enum: [self, related, all]
+              default: all
+            name: include
+          - in: query
+            schema:
+              type: string
+            name: q
+            description: >-
+              Case-insensitive search over the full history (summary,
+              entity name, kind, path, values) — applied before
+              pagination, so `count` reflects the matches.
+          - in: query
+            schema:
+              type: integer
+              minimum: 0
+              default: 0
+            name: page
+          - in: query
+            schema:
+              type: integer
+              minimum: 1
+              maximum: 200
+              default: 25
+            name: page_size
+          responses:
+            200:
+              description: Activity stream ordered newest-first
+              content:
+                application/json:
+                  schema: ActivityResponseSchema
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            403:
+              $ref: '#/components/responses/403'
+            404:
+              $ref: '#/components/responses/404'
+        """
+        # pylint: disable=import-outside-toplevel
+        from superset.versioning.activity import activity_endpoint
+
+        return activity_endpoint(self, Slice, uuid_str, request.args)
+
+    @expose(
+        "/<uuid_str>/versions/<version_uuid_str>/restore",
+        methods=("POST",),
+    )
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: (
+            f"{self.__class__.__name__}.restore_version"
+        ),
+        log_to_statsd=False,
+    )
+    def restore_version(self, uuid_str: str, version_uuid_str: str) -> Response:
+        """Restore a chart to a previous version.
+        ---
+        post:
+          summary: Revert a chart to an earlier version (non-destructive)
+          parameters:
+          - in: path
+            schema:
+              type: string
+              format: uuid
+            name: uuid_str
+            description: Chart UUID
+          - in: path
+            schema:
+              type: string
+              format: uuid
+            name: version_uuid_str
+            description: >-
+              Version UUID as returned by the list-versions endpoint.
+              Stable across retention pruning.
+          responses:
+            200:
+              description: Chart was restored
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      message:
+                        type: string
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            403:
+              $ref: '#/components/responses/403'
+            404:
+              $ref: '#/components/responses/404'
+            422:
+              $ref: '#/components/responses/422'
+        """
+        # pylint: disable=import-outside-toplevel
+        # Local import: the command module transitively imports the
+        # versioning bootstrap graph; see changes/listener.py.
+        from superset.commands.chart.restore_version import (
+            RestoreChartVersionCommand,
+        )
+
+        return restore_version_endpoint(
+            self, Slice, RestoreChartVersionCommand, uuid_str, version_uuid_str
+        )

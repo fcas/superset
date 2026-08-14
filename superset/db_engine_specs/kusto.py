@@ -1,0 +1,329 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+import logging
+import re
+from datetime import datetime
+from typing import Any, Optional, TYPE_CHECKING
+
+from sqlalchemy import func, types
+from sqlalchemy.dialects.mssql.base import SMALLDATETIME
+
+from superset.constants import TimeGrain
+from superset.db_engine_specs.base import BaseEngineSpec, DatabaseCategory
+from superset.db_engine_specs.exceptions import (
+    SupersetDBAPIDatabaseError,
+    SupersetDBAPIOperationalError,
+    SupersetDBAPIProgrammingError,
+)
+
+if TYPE_CHECKING:
+    from superset.models.core import Database
+
+from superset.sql.parse import KQLTokenType, LimitMethod, tokenize_kql
+from superset.utils.core import FilterOperator, GenericDataType
+
+logger = logging.getLogger(__name__)
+
+_OPENING_BRACKET = [
+    (KQLTokenType.WORD, "ARRAY"),
+    (KQLTokenType.OTHER, "("),
+    (KQLTokenType.OTHER, "["),
+]
+_CLOSING_BRACKET = [(KQLTokenType.OTHER, "]"), (KQLTokenType.OTHER, ")")]
+
+
+def strip_array_brackets(kql: str) -> str:
+    """
+    Replace ``ARRAY([...])`` wrappers with ``[...]`` using the KQL tokenizer.
+
+    SQLAlchemy sometimes wraps bracket-quoted KQL identifiers in ARRAY(),
+    which is invalid KQL. This strips the wrapper while preserving the contents.
+    """
+    tokens = tokenize_kql(kql)
+
+    to_remove: set[int] = set()
+    depth = 0
+    for i in range(len(tokens)):
+        if tokens[i : i + 3] == _OPENING_BRACKET:
+            to_remove.add(i)
+            to_remove.add(i + 1)
+            depth += 1
+        elif depth > 0 and tokens[i : i + 2] == _CLOSING_BRACKET:
+            to_remove.add(i + 1)
+            depth -= 1
+
+    tokens = [token for i, token in enumerate(tokens) if i not in to_remove]
+    return "".join(val for _, val in tokens)
+
+
+class KustoSqlEngineSpec(BaseEngineSpec):  # pylint: disable=abstract-method
+    limit_method = LimitMethod.WRAP_SQL
+    engine = "kustosql"
+    engine_name = "Azure Data Explorer"
+    time_groupby_inline = True
+    allows_joins = True
+    allows_subqueries = True
+    allows_sql_comments = False
+
+    metadata = {
+        "description": (
+            "Azure Data Explorer (Kusto) is a fast, fully managed data analytics "
+            "service from Microsoft Azure. Query data using SQL or native KQL syntax."
+        ),
+        "logo": "kusto.png",
+        "homepage_url": "https://azure.microsoft.com/en-us/products/data-explorer/",
+        "categories": [
+            DatabaseCategory.CLOUD_AZURE,
+            DatabaseCategory.ANALYTICAL_DATABASES,
+            DatabaseCategory.PROPRIETARY,
+        ],
+        "pypi_packages": ["sqlalchemy-kusto"],
+        "connection_string": (
+            "kustosql+https://{cluster}.kusto.windows.net/{database}"
+            "?msi=False&azure_ad_client_id={client_id}"
+            "&azure_ad_client_secret={client_secret}"
+            "&azure_ad_tenant_id={tenant_id}"
+        ),
+        "parameters": {
+            "cluster": "Azure Data Explorer cluster name",
+            "database": "Database name",
+            "client_id": "Azure AD application (client) ID",
+            "client_secret": "Azure AD application secret",
+            "tenant_id": "Azure AD tenant ID",
+        },
+        "drivers": [
+            {
+                "name": "SQL Interface (Recommended)",
+                "pypi_package": "sqlalchemy-kusto",
+                "connection_string": (
+                    "kustosql+https://{cluster}.kusto.windows.net/{database}"
+                    "?msi=False&azure_ad_client_id={client_id}"
+                    "&azure_ad_client_secret={client_secret}"
+                    "&azure_ad_tenant_id={tenant_id}"
+                ),
+                "is_recommended": True,
+                "notes": "Use familiar SQL syntax to query Azure Data Explorer.",
+            },
+            {
+                "name": "KQL (Kusto Query Language)",
+                "pypi_package": "sqlalchemy-kusto",
+                "connection_string": (
+                    "kustokql+https://{cluster}.kusto.windows.net/{database}"
+                    "?msi=False&azure_ad_client_id={client_id}"
+                    "&azure_ad_client_secret={client_secret}"
+                    "&azure_ad_tenant_id={tenant_id}"
+                ),
+                "is_recommended": False,
+                "notes": "Use native Kusto Query Language for advanced analytics.",
+            },
+        ],
+        "known_incompatibilities": [
+            {
+                "dependency": "SQLAlchemy 2.0",
+                "reason": (
+                    "setup.py on the sqlalchemy-kusto main branch hard-pins "
+                    "sqlalchemy==1.4.*; no SQLAlchemy 2.0 work has started."
+                ),
+                "tracking_url": "https://github.com/dodopizza/sqlalchemy-kusto",
+                "since": "2026-07-28",
+            }
+        ],
+    }
+
+    _time_grain_expressions = {
+        None: "{col}",
+        TimeGrain.SECOND: "DATEADD(second, \
+            'DATEDIFF(second, 2000-01-01', {col}), '2000-01-01')",
+        TimeGrain.MINUTE: "DATEADD(minute, DATEDIFF(minute, 0, {col}), 0)",
+        TimeGrain.FIVE_MINUTES: "DATEADD(minute, DATEDIFF(minute, 0, {col}) / 5 * 5, 0)",  # noqa: E501
+        TimeGrain.TEN_MINUTES: "DATEADD(minute, \
+            DATEDIFF(minute, 0, {col}) / 10 * 10, 0)",
+        TimeGrain.FIFTEEN_MINUTES: "DATEADD(minute, \
+            DATEDIFF(minute, 0, {col}) / 15 * 15, 0)",
+        TimeGrain.HALF_HOUR: "DATEADD(minute, DATEDIFF(minute, 0, {col}) / 30 * 30, 0)",
+        TimeGrain.HOUR: "DATEADD(hour, DATEDIFF(hour, 0, {col}), 0)",
+        TimeGrain.DAY: "DATEADD(day, DATEDIFF(day, 0, {col}), 0)",
+        TimeGrain.WEEK: "DATEADD(day, -1, DATEADD(week, DATEDIFF(week, 0, {col}), 0))",
+        TimeGrain.MONTH: "DATEADD(month, DATEDIFF(month, 0, {col}), 0)",
+        TimeGrain.QUARTER: "DATEADD(quarter, DATEDIFF(quarter, 0, {col}), 0)",
+        TimeGrain.YEAR: "DATEADD(year, DATEDIFF(year, 0, {col}), 0)",
+        TimeGrain.WEEK_STARTING_SUNDAY: "DATEADD(day, -1,"
+        " DATEADD(week, DATEDIFF(week, 0, {col}), 0))",
+        TimeGrain.WEEK_STARTING_MONDAY: "DATEADD(week,"
+        " DATEDIFF(week, 0, DATEADD(day, -1, {col})), 0)",
+    }
+
+    type_code_map: dict[int, str] = {}  # loaded from get_datatype only if needed
+
+    column_type_mappings = (
+        (
+            re.compile(r"^smalldatetime.*", re.IGNORECASE),
+            SMALLDATETIME(),
+            GenericDataType.TEMPORAL,
+        ),
+    )
+
+    @classmethod
+    def get_dbapi_exception_mapping(cls) -> dict[type[Exception], type[Exception]]:
+        # pylint: disable=import-outside-toplevel,import-error
+        import sqlalchemy_kusto.errors as kusto_exceptions
+
+        return {
+            kusto_exceptions.DatabaseError: SupersetDBAPIDatabaseError,
+            kusto_exceptions.OperationalError: SupersetDBAPIOperationalError,
+            kusto_exceptions.ProgrammingError: SupersetDBAPIProgrammingError,
+        }
+
+    @classmethod
+    def convert_dttm(
+        cls, target_type: str, dttm: datetime, db_extra: Optional[dict[str, Any]] = None
+    ) -> Optional[str]:
+        sqla_type = cls.get_sqla_column_type(target_type)
+
+        if isinstance(sqla_type, types.Date):
+            return f"CONVERT(DATE, '{dttm.date().isoformat()}', 23)"
+        if isinstance(sqla_type, types.TIMESTAMP):
+            datetime_formatted = dttm.isoformat(sep=" ", timespec="seconds")
+            return f"""CONVERT(TIMESTAMP, '{datetime_formatted}', 20)"""
+        if isinstance(sqla_type, SMALLDATETIME):
+            datetime_formatted = dttm.isoformat(sep=" ", timespec="seconds")
+            return f"""CONVERT(SMALLDATETIME, '{datetime_formatted}', 20)"""
+        if isinstance(sqla_type, types.DateTime):
+            datetime_formatted = dttm.isoformat(timespec="milliseconds")
+            return f"""CONVERT(DATETIME, '{datetime_formatted}', 126)"""
+        return None
+
+
+class KustoKqlEngineSpec(BaseEngineSpec):  # pylint: disable=abstract-method
+    """Azure Data Explorer engine spec using native KQL query language.
+
+    Note: Documentation is consolidated in KustoSqlEngineSpec (Azure Data Explorer).
+    This spec exists for runtime support of the kustokql driver.
+    """
+
+    engine = "kustokql"
+    engine_name = "Azure Data Explorer (KQL)"
+    time_groupby_inline = True
+    allows_joins = True
+    allows_subqueries = True
+    allows_sql_comments = False
+    run_multiple_statements_as_one = True
+
+    _time_grain_expressions = {
+        None: "{col}",
+        TimeGrain.SECOND: "bin({col},1s)",
+        TimeGrain.THIRTY_SECONDS: "bin({col},30s)",
+        TimeGrain.MINUTE: "bin({col},1m)",
+        TimeGrain.FIVE_MINUTES: "bin({col},5m)",
+        TimeGrain.THIRTY_MINUTES: "bin({col},30m)",
+        TimeGrain.HOUR: "bin({col},1h)",
+        TimeGrain.DAY: "startofday({col})",
+        TimeGrain.WEEK: "startofweek({col})",
+        TimeGrain.MONTH: "startofmonth({col})",
+        TimeGrain.YEAR: "startofyear({col})",
+    }
+
+    type_code_map: dict[int, str] = {}  # loaded from get_datatype only if needed
+
+    column_type_mappings = (
+        (
+            re.compile(r"^array.*", re.IGNORECASE),
+            types.String(),
+            GenericDataType.STRING,
+        ),
+    )
+
+    @classmethod
+    def get_dbapi_exception_mapping(cls) -> dict[type[Exception], type[Exception]]:
+        # pylint: disable=import-outside-toplevel,import-error
+        import sqlalchemy_kusto.errors as kusto_exceptions
+
+        return {
+            kusto_exceptions.DatabaseError: SupersetDBAPIDatabaseError,
+            kusto_exceptions.OperationalError: SupersetDBAPIOperationalError,
+            kusto_exceptions.ProgrammingError: SupersetDBAPIProgrammingError,
+        }
+
+    @classmethod
+    def handle_null_filter(
+        cls,
+        sqla_col: Any,
+        op: FilterOperator,
+    ) -> Any:
+        """
+        Handle null/not null filter operations for KQL.
+
+        In KQL, null checks use functions:
+        - isnull(col) for IS NULL
+        - isnotnull(col) for IS NOT NULL
+
+        :param sqla_col: SQLAlchemy column element
+        :param op: Filter operator (IS_NULL or IS_NOT_NULL)
+        :return: SQLAlchemy expression for the null filter
+        """
+        if op == FilterOperator.IS_NULL:
+            return func.isnull(sqla_col)
+        if op == FilterOperator.IS_NOT_NULL:
+            return func.isnotnull(sqla_col)
+
+        raise ValueError(f"Invalid null filter operator: {op}")
+
+    @classmethod
+    def epoch_to_dttm(cls) -> str:
+        """
+        Convert from number of seconds since the epoch to a timestamp.
+        """
+        return "unixtime_seconds_todatetime({col})"
+
+    @classmethod
+    def epoch_ms_to_dttm(cls) -> str:
+        """
+        Convert from number of milliseconds since the epoch to a timestamp.
+        """
+        return "unixtime_milliseconds_todatetime({col})"
+
+    @classmethod
+    def convert_dttm(
+        cls, target_type: str, dttm: datetime, db_extra: Optional[dict[str, Any]] = None
+    ) -> Optional[str]:
+        sqla_type = cls.get_sqla_column_type(target_type)
+
+        if isinstance(sqla_type, types.Date):
+            return f"""datetime({dttm.date().isoformat()})"""
+        if isinstance(sqla_type, types.DateTime):
+            return f"""datetime({dttm.isoformat(timespec="microseconds")})"""
+
+        return None
+
+    @classmethod
+    def execute(
+        cls,
+        cursor: Any,
+        query: str,
+        database: "Database",
+        **kwargs: Any,
+    ) -> None:
+        """
+        Execute a KQL query, fixing ARRAY() wrappers around
+        bracket-quoted identifiers.
+
+        Example:
+            ARRAY(["age"]) -> ["age"]
+            ARRAY(["user_name"]) -> ["user_name"]
+        """
+        processed_query = strip_array_brackets(query)
+        super().execute(cursor, processed_query, database, **kwargs)

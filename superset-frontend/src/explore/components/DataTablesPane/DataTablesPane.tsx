@@ -1,0 +1,294 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS
+ * OF ANY KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { useCallback, useEffect, useMemo, useState, MouseEvent } from 'react';
+import { t } from '@apache-superset/core/translation';
+import { isFeatureEnabled, FeatureFlag } from '@superset-ui/core';
+import { css, styled } from '@apache-superset/core/theme';
+import { Icons } from '@superset-ui/core/components/Icons';
+import Tabs from '@superset-ui/core/components/Tabs';
+import {
+  getItem,
+  setItem,
+  LocalStorageKeys,
+} from 'src/utils/localStorageHelpers';
+import { SamplesPane, useResultsPane } from './components';
+import { DataTablesPaneProps, ResultTypes } from './types';
+
+/**
+ * A mixed chart can be reconfigured to return fewer result panes than before
+ * (e.g. dropping a query), which removes the corresponding results tab. If the
+ * selected tab was one of those, the active key goes stale and the data panel
+ * renders blank until the user reselects a valid tab. Returns the first
+ * results tab to fall back to in that case, otherwise undefined.
+ */
+export const getStaleResultsTabFallback = (
+  activeTabKey: string,
+  resultsTabKeys: string[],
+): string | undefined =>
+  activeTabKey.startsWith(ResultTypes.Results) &&
+  !resultsTabKeys.includes(activeTabKey)
+    ? ResultTypes.Results
+    : undefined;
+
+const StyledDiv = styled.div`
+  ${() => `
+    display: flex;
+    height: 100%;
+    flex-direction: column;
+    `}
+`;
+
+const SouthPane = styled.div`
+  ${({ theme }) => `
+    position: relative;
+    background-color: ${theme.colorBgContainer};
+    z-index: 5;
+    overflow: hidden;
+
+    .ant-tabs {
+      height: 100%;
+    }
+
+    .ant-tabs-body-holder {
+      height: 100%;
+    }
+
+    .ant-tabs-body {
+      height: 100%;
+    }
+
+    .ant-tabs-content {
+      height: 100%;
+      position: relative;
+
+      .table-condensed {
+        height: 100%;
+        overflow: auto;
+        margin-bottom: ${theme.sizeUnit * 4}px;
+
+        .table {
+          margin-bottom: ${theme.sizeUnit * 2}px;
+        }
+      }
+     .pagination-container > ul[role='navigation'] {
+        margin-top: 0;
+      }
+    }
+  `}
+`;
+
+export const DataTablesPane = ({
+  queryFormData,
+  datasource,
+  queryForce,
+  onCollapseChange,
+  chartStatus,
+  ownState,
+  errorMessage,
+  setForceQuery,
+  canDownload,
+  queriesResponse,
+}: DataTablesPaneProps) => {
+  const [activeTabKey, setActiveTabKey] = useState<string>(ResultTypes.Results);
+  const [isRequest, setIsRequest] = useState<Record<ResultTypes, boolean>>({
+    results: false,
+    samples: false,
+  });
+  const [panelOpen, setPanelOpen] = useState(
+    isFeatureEnabled(FeatureFlag.DatapanelClosedByDefault)
+      ? false
+      : getItem(LocalStorageKeys.IsDatapanelOpen, false),
+  );
+
+  useEffect(() => {
+    if (!isFeatureEnabled(FeatureFlag.DatapanelClosedByDefault))
+      setItem(LocalStorageKeys.IsDatapanelOpen, panelOpen);
+  }, [panelOpen]);
+
+  useEffect(() => {
+    if (!panelOpen) {
+      setIsRequest({
+        results: false,
+        samples: false,
+      });
+    }
+
+    if (panelOpen && chartStatus === 'loading') {
+      setIsRequest(prev => ({ ...prev, results: false }));
+    }
+
+    if (
+      panelOpen &&
+      activeTabKey.startsWith(ResultTypes.Results) &&
+      chartStatus &&
+      chartStatus !== 'loading'
+    ) {
+      setIsRequest({
+        results: true,
+        samples: false,
+      });
+    }
+
+    if (panelOpen && activeTabKey === ResultTypes.Samples) {
+      setIsRequest({
+        results: false,
+        samples: true,
+      });
+    }
+  }, [panelOpen, activeTabKey, chartStatus]);
+
+  const handleCollapseChange = useCallback(
+    (isOpen: boolean) => {
+      onCollapseChange(isOpen);
+      setPanelOpen(isOpen);
+    },
+    [onCollapseChange],
+  );
+
+  const handleTabClick = useCallback(
+    (tabKey: string, e: MouseEvent) => {
+      if (!panelOpen) {
+        handleCollapseChange(true);
+      } else if (tabKey === activeTabKey) {
+        e.preventDefault();
+        handleCollapseChange(false);
+      }
+      setActiveTabKey(tabKey);
+    },
+    [activeTabKey, handleCollapseChange, panelOpen],
+  );
+
+  const CollapseButton = useMemo(() => {
+    const caretIcon = panelOpen ? (
+      <Icons.UpOutlined aria-label={t('Collapse data panel')} />
+    ) : (
+      <Icons.DownOutlined aria-label={t('Expand data panel')} />
+    );
+    const resetButtonCss = css`
+      appearance: none;
+      border: none;
+      background: none;
+      padding: 0;
+      font: inherit;
+    `;
+    return (
+      <div>
+        {panelOpen ? (
+          <button
+            type="button"
+            css={resetButtonCss}
+            onClick={() => handleCollapseChange(false)}
+          >
+            {caretIcon}
+          </button>
+        ) : (
+          <button
+            type="button"
+            css={resetButtonCss}
+            onClick={() => handleCollapseChange(true)}
+          >
+            {caretIcon}
+          </button>
+        )}
+      </div>
+    );
+  }, [handleCollapseChange, panelOpen]);
+
+  const queryResultsPanes = useResultsPane({
+    errorMessage,
+    queryFormData,
+    queryForce,
+    ownState,
+    isRequest: isRequest.results,
+    setForceQuery,
+    canDownload,
+    queriesResponse,
+  }).map((pane, idx) => {
+    const tabKey =
+      idx === 0 ? ResultTypes.Results : `${ResultTypes.Results} ${idx + 1}`;
+
+    return {
+      key: tabKey,
+      label: idx === 0 ? t('Results') : t('Results %s', idx + 1),
+      children: activeTabKey === tabKey ? pane : null,
+    };
+  });
+
+  const resultsTabFallback = getStaleResultsTabFallback(
+    activeTabKey,
+    queryResultsPanes.map(({ key }) => key),
+  );
+
+  useEffect(() => {
+    if (resultsTabFallback) {
+      setActiveTabKey(resultsTabFallback);
+    }
+  }, [resultsTabFallback]);
+
+  // Hide the Samples tab for datasources that don't expose raw rows
+  // (e.g. semantic views). The check is intentionally ``=== false`` so that
+  // datasources from older backends that don't send the flag still show the
+  // tab and preserve current behavior.
+  const showSamplesTab = datasource?.supports_samples !== false;
+
+  // If the datasource swaps to one that doesn't support samples while the
+  // Samples tab is active (e.g. the user picks a semantic view), the tab
+  // disappears from ``tabItems`` and ``activeTabKey`` is orphaned. Fall back
+  // to Results so the panel keeps rendering content.
+  useEffect(() => {
+    if (!showSamplesTab && activeTabKey === ResultTypes.Samples) {
+      setActiveTabKey(ResultTypes.Results);
+    }
+  }, [showSamplesTab, activeTabKey]);
+  const tabItems = [
+    ...queryResultsPanes,
+    ...(showSamplesTab
+      ? [
+          {
+            key: ResultTypes.Samples,
+            label: t('Samples'),
+            children: (
+              <StyledDiv>
+                <SamplesPane
+                  datasource={datasource}
+                  queryFormData={queryFormData}
+                  queryForce={queryForce}
+                  isRequest={isRequest.samples}
+                  setForceQuery={setForceQuery}
+                  isVisible={ResultTypes.Samples === activeTabKey}
+                  canDownload={canDownload}
+                />
+              </StyledDiv>
+            ),
+          },
+        ]
+      : []),
+  ];
+
+  return (
+    <SouthPane data-test="some-purposeful-instance">
+      <Tabs
+        tabBarExtraContent={CollapseButton}
+        activeKey={panelOpen ? activeTabKey : ''}
+        onTabClick={handleTabClick}
+        items={tabItems}
+      />
+    </SouthPane>
+  );
+};

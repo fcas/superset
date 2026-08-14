@@ -1,0 +1,75 @@
+name: 'Setup Python Environment'
+description: 'Set up Python and install dependencies with optional configurations.'
+inputs:
+  python-version:
+    description: 'Python version to set up. Accepts a version number, "current", or "next".'
+    required: true
+    default: 'current'
+  requirements-type:
+    description: 'Type of requirements to install. Options: base, development, default'
+    required: false
+    default: 'dev'
+  install-superset:
+    description: 'Whether to install Superset itself. If false, only python is installed'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Interpret Python Version
+      id: set-python-version
+      shell: bash
+      env:
+        INPUT_PYTHON_VERSION: ${{ inputs.python-version }}
+      run: |
+        if [ "$INPUT_PYTHON_VERSION" = "current" ]; then
+          RESOLVED_VERSION="3.11"
+        elif [ "$INPUT_PYTHON_VERSION" = "next" ]; then
+          # currently disabled in GHA matrixes because of library compatibility issues
+          RESOLVED_VERSION="3.12"
+        elif printf '%s' "$INPUT_PYTHON_VERSION" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+          RESOLVED_VERSION="$INPUT_PYTHON_VERSION"
+        else
+          echo "Invalid python-version: '$INPUT_PYTHON_VERSION'" >&2
+          exit 1
+        fi
+        echo "python-version=$RESOLVED_VERSION" >> "$GITHUB_OUTPUT"
+    - name: Set up Python ${{ steps.set-python-version.outputs.python-version }}
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: ${{ steps.set-python-version.outputs.python-version }}
+    - name: Install uv
+      if: inputs.install-superset == 'true'
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      with:
+        python-version: ${{ steps.set-python-version.outputs.python-version }}
+        enable-cache: true
+    - name: Update apt package lists
+      # cache-apt-pkgs-action assumes a fresh `apt-cache` index (true on GitHub-hosted
+      # runners, not on all self-hosted/custom runner images), so refresh it explicitly
+      # or package lookups silently resolve to an empty list.
+      if: inputs.install-superset == 'true'
+      shell: bash
+      run: sudo apt-get update
+    - name: Install apt packages
+      if: inputs.install-superset == 'true'
+      uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+      with:
+        packages: libldap2-dev libsasl2-dev
+        version: 1.0
+    - name: Install dependencies
+      env:
+        INPUT_INSTALL_SUPERSET: ${{ inputs.install-superset }}
+        INPUT_REQUIREMENTS_TYPE: ${{ inputs.requirements-type }}
+      run: |
+        if [ "$INPUT_INSTALL_SUPERSET" = "true" ]; then
+          if [ "$INPUT_REQUIREMENTS_TYPE" = "dev" ]; then
+            uv pip install --system -r requirements/development.txt
+          elif [ "$INPUT_REQUIREMENTS_TYPE" = "base" ]; then
+            uv pip install --system -r requirements/base.txt
+          fi
+
+          uv pip install --system -e .
+        fi
+      shell: bash

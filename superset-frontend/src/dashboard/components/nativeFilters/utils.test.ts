@@ -1,0 +1,137 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { Behavior } from '@superset-ui/core';
+import { DashboardLayout, LayoutItem } from 'src/dashboard/types';
+import { CHART_TYPE } from 'src/dashboard/util/componentTypes';
+import { createChartLayoutItemMap } from 'src/dashboard/util/getChartIdsInFilterScope';
+import {
+  nativeFilterGate,
+  findTabsWithChartsInScope,
+  getFormData,
+} from './utils';
+
+// eslint-disable-next-line no-restricted-globals -- TODO: Migrate from describe blocks
+describe('nativeFilterGate', () => {
+  test('should return true for regular chart', () => {
+    expect(nativeFilterGate([])).toEqual(true);
+  });
+
+  test('should return true for cross filter chart', () => {
+    expect(nativeFilterGate([Behavior.InteractiveChart])).toEqual(true);
+  });
+
+  test('should return true for native filter chart with cross filter support', () => {
+    expect(
+      nativeFilterGate([Behavior.NativeFilter, Behavior.InteractiveChart]),
+    ).toEqual(true);
+  });
+
+  test('should return false for native filter behavior', () => {
+    expect(nativeFilterGate([Behavior.NativeFilter])).toEqual(false);
+  });
+});
+
+test('findTabsWithChartsInScope should handle a recursive layout structure', () => {
+  const dashboardLayout = {
+    DASHBOARD_VERSION_KEY: 'v2',
+    ROOT_ID: {
+      children: ['GRID_ID'],
+      id: 'ROOT_ID',
+      type: 'ROOT',
+    },
+    GRID_ID: {
+      children: ['TAB-LrujeuD5Qn', 'TABS-kN7tw6vFif'],
+      id: 'GRID_ID',
+      parents: ['ROOT_ID'],
+      type: 'GRID',
+    },
+    'TAB-LrujeuD5Qn': {
+      children: ['TABS-kN7tw6vFif'],
+      id: 'TAB-LrujeuD5Qn',
+      meta: {
+        text: 'View by Totals',
+      },
+      parents: ['ROOT_ID'],
+      type: 'TAB',
+    },
+    'TABS-kN7tw6vFif': {
+      children: ['TAB-LrujeuD5Qn', 'TAB--7BUkKkNl'],
+      id: 'TABS-kN7tw6vFif',
+      meta: {},
+      parents: ['ROOT_ID'],
+      type: 'TABS',
+    },
+  } as any as DashboardLayout;
+
+  const chartLayoutItems = Object.values(dashboardLayout).filter(
+    item => item.type === CHART_TYPE,
+  );
+  expect(Array.from(findTabsWithChartsInScope(chartLayoutItems, []))).toEqual(
+    [],
+  );
+});
+
+test('findTabsWithChartsInScope includes tabs from duplicate chart holders', () => {
+  const chartLayoutItems: LayoutItem[] = [
+    {
+      id: 'CHART-7-first',
+      type: CHART_TYPE,
+      children: [],
+      parents: ['ROOT_ID', 'TAB-parent', 'TABS-nested', 'TAB-first'],
+      meta: {
+        chartId: 7,
+        height: 100,
+        width: 100,
+        uuid: 'test-uuid-CHART-7-first',
+      },
+    },
+    {
+      id: 'CHART-7-second',
+      type: CHART_TYPE,
+      children: [],
+      parents: ['ROOT_ID', 'TAB-parent', 'TABS-nested', 'TAB-second'],
+      meta: {
+        chartId: 7,
+        height: 100,
+        width: 100,
+        uuid: 'test-uuid-CHART-7-second',
+      },
+    },
+  ];
+  const chartLayoutItemMap = createChartLayoutItemMap(chartLayoutItems);
+
+  expect(
+    Array.from(findTabsWithChartsInScope(chartLayoutItemMap, [7])),
+  ).toEqual(['TAB-parent', 'TAB-first', 'TAB-second']);
+});
+
+test('getFormData should include persisted time_grains for time grain filters', () => {
+  const formData = getFormData({
+    dashboardId: 10,
+    id: 'NATIVE_FILTER-1',
+    filterType: 'filter_timegrain',
+    type: 'NATIVE_FILTER' as any,
+    controlValues: {},
+    defaultDataMask: {},
+    datasetId: 11,
+    time_grains: ['PT1H', 'P1D', 'P1W'],
+  });
+
+  expect((formData as any).time_grains).toEqual(['PT1H', 'P1D', 'P1W']);
+});

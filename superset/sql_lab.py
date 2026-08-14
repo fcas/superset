@@ -1,197 +1,765 @@
-import celery
-from time import sleep
-from datetime import datetime
-import json
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+# pylint: disable=consider-using-transaction
+import dataclasses
 import logging
-import pandas as pd
-import sqlalchemy
+import sys
+import traceback
 import uuid
+from contextlib import closing
+from datetime import datetime
+from sys import getsizeof
+from typing import Any, cast, Optional, TYPE_CHECKING, TypeVar, Union
 
-from sqlalchemy.pool import NullPool
-from sqlalchemy.orm import sessionmaker
+import backoff
+import msgpack
+from celery.exceptions import SoftTimeLimitExceeded
+from flask import current_app as app, has_app_context
+from flask_babel import gettext as __
 
 from superset import (
-    app, db, utils, dataframe, results_backend)
+    db,
+    is_feature_enabled,
+    results_backend,
+    results_backend_use_msgpack,
+    security_manager,
+)
+from superset.common.db_query_status import QueryStatus
+from superset.constants import QUERY_CANCEL_KEY, QUERY_EARLY_CANCEL_KEY
+from superset.dataframe import df_to_records
+from superset.db_engine_specs import BaseEngineSpec
+from superset.errors import ErrorLevel, SupersetError, SupersetErrorType
+from superset.exceptions import (
+    OAuth2RedirectError,
+    SupersetDisallowedSQLFunctionException,
+    SupersetDisallowedSQLTableException,
+    SupersetDMLNotAllowedException,
+    SupersetErrorException,
+    SupersetErrorsException,
+    SupersetInvalidCTASException,
+    SupersetInvalidCVASException,
+    SupersetResultsBackendNotConfigureException,
+)
+from superset.extensions import celery_app, event_logger
 from superset.models.sql_lab import Query
-from superset.sql_parse import SupersetQuery
-from superset.db_engine_specs import LimitMethod
-from superset.jinja_context import get_template_processor
-from superset.utils import QueryStatus
+from superset.result_set import SupersetResultSet
+from superset.sql.execution.executor import build_statement_blocks
+from superset.sql.parse import BaseSQLStatement, CTASMethod, SQLScript, Table
+from superset.sqllab.limiting_factor import LimitingFactor
+from superset.sqllab.utils import write_ipc_buffer
+from superset.utils import json
+from superset.utils.core import (
+    override_user,
+    QuerySource,
+    zlib_compress,
+)
+from superset.utils.dates import now_as_float
+from superset.utils.decorators import stats_timing
+from superset.utils.rls import apply_rls
 
-celery_app = celery.Celery(config_source=app.config.get('CELERY_CONFIG'))
+if TYPE_CHECKING:
+    from superset.models.core import Database
 
-
-def dedup(l, suffix='__'):
-    """De-duplicates a list of string by suffixing a counter
-
-    Always returns the same number of entries as provided, and always returns
-    unique values.
-
-    >>> dedup(['foo', 'bar', 'bar', 'bar'])
-    ['foo', 'bar', 'bar__1', 'bar__2']
-    """
-    new_l = []
-    seen = {}
-    for s in l:
-        if s in seen:
-            seen[s] += 1
-            s += suffix + str(seen[s])
-        else:
-            seen[s] = 0
-        new_l.append(s)
-    return new_l
+logger = logging.getLogger(__name__)
+BYTES_IN_MB = 1024 * 1024
 
 
-@celery_app.task(bind=True)
-def get_sql_results(self, query_id, return_results=True, store_results=False):
-    """Executes the sql query returns the results."""
-    if not self.request.called_directly:
-        engine = sqlalchemy.create_engine(
-            app.config.get('SQLALCHEMY_DATABASE_URI'), poolclass=NullPool)
-        session_class = sessionmaker()
-        session_class.configure(bind=engine)
-        session = session_class()
+class SqlLabException(Exception):  # noqa: N818
+    pass
+
+
+class SqlLabSecurityException(SqlLabException):
+    pass
+
+
+class SqlLabQueryStoppedException(SqlLabException):
+    pass
+
+
+def handle_query_error(
+    ex: Exception,
+    query: Query,
+    payload: Optional[dict[str, Any]] = None,
+    prefix_message: str = "",
+) -> dict[str, Any]:
+    """Local method handling error while processing the SQL"""
+    payload = payload or {}
+    msg = f"{prefix_message} {str(ex)}".strip()
+    query.error_message = msg
+    query.tmp_table_name = None
+    query.status = QueryStatus.FAILED
+    # TODO: re-enable this after updating the frontend to properly display timeout status  # noqa: E501
+    # if query.status != QueryStatus.TIMED_OUT:
+    #   query.status = QueryStatus.FAILED
+    if not query.end_time:
+        query.end_time = now_as_float()
+
+    # extract DB-specific errors (invalid column, eg)
+    if isinstance(ex, SupersetErrorException):
+        errors = [ex.error]
+    elif isinstance(ex, SupersetErrorsException):
+        errors = ex.errors
     else:
-        session = db.session()
-        session.commit()  # HACK
-    try:
-        query = session.query(Query).filter_by(id=query_id).one()
-    except Exception as e:
-        logging.error(
-            "Query with id `{}` could not be retrieved".format(query_id))
-        logging.error("Sleeping for a sec and retrying...")
-        # Nasty hack to get around a race condition where the worker
-        # cannot find the query it's supposed to run
-        sleep(1)
-        query = session.query(Query).filter_by(id=query_id).one()
+        errors = query.database.db_engine_spec.extract_errors(
+            str(ex), database_name=query.database.unique_name
+        )
 
+    errors_payload = [dataclasses.asdict(error) for error in errors]
+    if errors:
+        query.set_extra_json_key("errors", errors_payload)
+
+    db.session.commit()
+    payload.update({"status": query.status, "error": msg, "errors": errors_payload})
+    if app.config.get("SHOW_STACKTRACE"):
+        if stacktrace := traceback.format_exc():
+            payload["stacktrace"] = stacktrace
+    if troubleshooting_link := app.config["TROUBLESHOOTING_LINK"]:
+        payload["link"] = troubleshooting_link
+    return payload
+
+
+def get_query_backoff_handler(details: dict[Any, Any]) -> None:
+    stats_logger = app.config["STATS_LOGGER"]
+    query_id = details["kwargs"]["query_id"]
+    stats_logger.incr(f"error_attempting_orm_query_{details['tries'] - 1}")
+    logger.warning(
+        "Query with id `%s` could not be retrieved, sleeping for a sec before retrying",
+        str(query_id),
+        exc_info=True,
+    )
+
+
+def get_query_giveup_handler(_: Any) -> None:
+    stats_logger = app.config["STATS_LOGGER"]
+    stats_logger.incr("error_failed_at_getting_orm_query")
+
+
+@backoff.on_exception(
+    backoff.constant,
+    SqlLabException,
+    interval=1,
+    on_backoff=get_query_backoff_handler,
+    on_giveup=get_query_giveup_handler,
+    max_tries=5,
+)
+def get_query(query_id: int) -> Query:
+    """attempts to get the query and retry if it cannot"""
+    try:
+        return db.session.query(Query).filter_by(id=query_id).one()
+    except Exception as ex:
+        # roll back so a poisoned session (e.g. PendingRollbackError after a
+        # failed flush) doesn't fail every subsequent backoff retry identically.
+        # Swallow rollback failures so a session/connection too broken to roll
+        # back doesn't replace the original exception with one the backoff
+        # decorator won't retry on.
+        try:
+            db.session.rollback()
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("Failed to roll back session in get_query", exc_info=True)
+        raise SqlLabException("Failed at getting query") from ex
+
+
+# Default timeouts from config.py:
+# SQLLAB_TIMEOUT = 30 seconds
+# SQLLAB_ASYNC_TIME_LIMIT_SEC = 6 hours
+# SQLLAB_HARD_TIMEOUT = SQLLAB_ASYNC_TIME_LIMIT_SEC + 60
+@celery_app.task(
+    name="sql_lab.get_sql_results",
+    time_limit=21660,  # 6 hours + 60 seconds
+    soft_time_limit=21600,  # 6 hours
+)
+def get_sql_results(  # pylint: disable=too-many-arguments
+    query_id: int,
+    rendered_query: str,
+    return_results: bool = True,
+    store_results: bool = False,
+    username: Optional[str] = None,
+    start_time: Optional[float] = None,
+    expand_data: bool = False,
+    log_params: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
+    """Executes the sql query returns the results."""
+    with app.test_request_context():
+        with override_user(security_manager.find_user(username)):
+            try:
+                return execute_sql_statements(
+                    query_id,
+                    rendered_query,
+                    return_results,
+                    store_results,
+                    start_time=start_time,
+                    expand_data=expand_data,
+                    log_params=log_params,
+                )
+            except Exception as ex:  # pylint: disable=broad-except
+                logger.exception("Query %d: %s", query_id, ex)
+                stats_logger = app.config["STATS_LOGGER"]
+                stats_logger.incr("error_sqllab_unhandled")
+                query = get_query(query_id=query_id)
+                return handle_query_error(ex, query)
+
+
+S = TypeVar("S", bound=BaseSQLStatement[Any])
+
+
+def apply_ctas(query: Query, parsed_statement: S) -> S:
+    """
+    Apply CTAS/CVAS.
+    """
+    if not query.tmp_table_name:
+        start_dttm = datetime.fromtimestamp(query.start_time)
+        prefix = f"tmp_{query.user_id}_table"
+        query.tmp_table_name = start_dttm.strftime(f"{prefix}_%Y_%m_%d_%H_%M_%S")
+
+    catalog = (
+        query.catalog
+        if query.database.db_engine_spec.supports_cross_catalog_queries
+        else None
+    )
+    table = Table(query.tmp_table_name, query.tmp_schema_name, catalog)
+    method = CTASMethod[query.ctas_method.upper()]
+
+    return parsed_statement.as_create_table(table, method)  # type: ignore[return-value]
+
+
+def apply_limit(query: Query, parsed_statement: BaseSQLStatement[Any]) -> None:
+    """
+    Apply limit to the SQL statement.
+    """
+    sqllab_ctas_no_limit = app.config["SQLLAB_CTAS_NO_LIMIT"]
+    sql_max_row = app.config["SQL_MAX_ROW"]
+
+    # Do not apply limit to the CTA queries when SQLLAB_CTAS_NO_LIMIT is set to true
+    if parsed_statement.is_mutating() or (
+        query.select_as_cta_used and sqllab_ctas_no_limit
+    ):
+        return
+
+    if sql_max_row and (not query.limit or query.limit > sql_max_row):
+        query.limit = sql_max_row
+
+    if query.limit:
+        parsed_statement.set_limit_value(
+            # fetch an extra row to inform user if there are more rows
+            query.limit + 1,
+            query.database.db_engine_spec.limit_method,
+        )
+
+
+def execute_query(  # pylint: disable=too-many-statements, too-many-locals  # noqa: C901
+    query: Query,
+    cursor: Any,
+    log_params: Optional[dict[str, Any]] = None,
+) -> SupersetResultSet:
+    """Executes a single SQL statement"""
+    database: Database = query.database
+    db_engine_spec = database.db_engine_spec
+
+    try:
+        log_query = app.config["QUERY_LOGGER"]
+        if log_query:
+            log_query(
+                query.database.sqlalchemy_uri,
+                query.executed_sql,
+                query.schema,
+                __name__,
+                security_manager,
+                log_params,
+            )
+        db.session.commit()
+        # Eagerly reload query attributes so no lazy-load triggers a new
+        # metadata DB connection during the (potentially long) cursor
+        # execution. With NullPool each lazy-load opens a fresh connection
+        # that stays idle for the query duration; if the query runs longer
+        # than the DB's idle_in_transaction_session_timeout the connection
+        # is killed, leaving the query stuck in "running" state forever.
+        db.session.expire_on_commit = False
+        try:
+            db.session.refresh(query)
+            _ = query.database
+            db.session.commit()
+        finally:
+            db.session.expire_on_commit = True
+        with event_logger.log_context(
+            action="execute_sql",
+            database=database,
+            object_ref=__name__,
+        ):
+            stats_logger = app.config["STATS_LOGGER"]
+            with stats_timing("sqllab.query.time_executing_query", stats_logger):
+                db_engine_spec.execute_with_cursor(cursor, query.executed_sql, query)
+
+            with stats_timing("sqllab.query.time_fetching_results", stats_logger):
+                logger.debug(
+                    "Query %d: Fetching data for query object: %s",
+                    query.id,
+                    str(query.to_dict()),
+                )
+                increased_limit = None if query.limit is None else query.limit + 1
+                data = db_engine_spec.fetch_data(cursor, increased_limit)
+                if query.limit is None or len(data) <= query.limit:
+                    query.limiting_factor = LimitingFactor.NOT_LIMITED
+                else:
+                    # return 1 row less than increased_query
+                    data = data[:-1]
+    except SoftTimeLimitExceeded as ex:
+        query.status = QueryStatus.TIMED_OUT
+
+        logger.warning("Query %d: Time limit exceeded", query.id)
+        logger.debug("Query %d: %s", query.id, ex)
+        raise SupersetErrorException(
+            SupersetError(
+                message=__(
+                    "The query was killed after %(sqllab_timeout)s seconds. It might "
+                    "be too complex, or the database might be under heavy load.",
+                    sqllab_timeout=app.config["SQLLAB_ASYNC_TIME_LIMIT_SEC"],
+                ),
+                error_type=SupersetErrorType.SQLLAB_TIMEOUT_ERROR,
+                level=ErrorLevel.ERROR,
+            )
+        ) from ex
+    except OAuth2RedirectError:
+        # user needs to authenticate with OAuth2 in order to run query
+        raise
+    except Exception as ex:
+        # query is stopped in another thread/worker
+        # stopping raises expected exceptions which we should skip
+        db.session.refresh(query)
+        if query.status == QueryStatus.STOPPED:
+            raise SqlLabQueryStoppedException() from ex
+
+        logger.debug("Query %d: %s", query.id, ex)
+        raise SqlLabException(db_engine_spec.extract_error_message(ex)) from ex
+
+    logger.debug("Query %d: Fetching cursor description", query.id)
+    cursor_description = cursor.description
+    return SupersetResultSet(data, cursor_description, db_engine_spec)
+
+
+def _serialize_payload(
+    payload: dict[Any, Any], use_msgpack: Optional[bool] = False
+) -> Union[bytes, str]:
+    logger.debug("Serializing to msgpack: %r", use_msgpack)
+    if use_msgpack:
+        return msgpack.dumps(payload, default=json.json_iso_dttm_ser, use_bin_type=True)
+
+    return json.dumps(payload, default=json.json_iso_dttm_ser, ignore_nan=True)
+
+
+def _serialize_and_expand_data(
+    result_set: SupersetResultSet,
+    db_engine_spec: BaseEngineSpec,
+    use_msgpack: Optional[bool] = False,
+    expand_data: bool = False,
+) -> tuple[Union[bytes, str], list[Any], list[Any], list[Any]]:
+    selected_columns = result_set.columns
+    all_columns: list[Any]
+    expanded_columns: list[Any]
+
+    if use_msgpack:
+        if has_app_context():
+            stats_logger = app.config["STATS_LOGGER"]
+            with stats_timing(
+                "sqllab.query.results_backend_pa_serialization", stats_logger
+            ):
+                data = write_ipc_buffer(result_set.pa_table).to_pybytes()
+        else:
+            # No app context, skip stats timing
+            data = write_ipc_buffer(result_set.pa_table).to_pybytes()
+
+        # expand when loading data from results backend
+        all_columns, expanded_columns = (selected_columns, [])
+    else:
+        df = result_set.to_pandas_df()
+        data = df_to_records(df) or []
+
+        if expand_data:
+            all_columns, data, expanded_columns = db_engine_spec.expand_data(
+                selected_columns, data
+            )
+        else:
+            all_columns = selected_columns
+            expanded_columns = []
+
+    return (data, selected_columns, all_columns, expanded_columns)
+
+
+def execute_sql_statements(  # noqa: C901
+    # pylint: disable=too-many-arguments, too-many-locals, too-many-statements, too-many-branches
+    query_id: int,
+    rendered_query: str,
+    return_results: bool,
+    store_results: bool,
+    start_time: Optional[float],
+    expand_data: bool,
+    log_params: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """Executes the sql query returns the results."""
+    if store_results and start_time:
+        # only asynchronous queries
+        stats_logger = app.config["STATS_LOGGER"]
+        stats_logger.timing("sqllab.query.time_pending", now_as_float() - start_time)
+
+    query = get_query(query_id=query_id)
+    payload: dict[str, Any] = {"query_id": query_id}
     database = query.database
     db_engine_spec = database.db_engine_spec
     db_engine_spec.patch()
 
-    def handle_error(msg):
-        """Local method handling error while processing the SQL"""
-        query.error_message = msg
-        query.status = QueryStatus.FAILED
-        query.tmp_table_name = None
-        session.commit()
-        raise Exception(query.error_message)
+    if database.allow_run_async and not results_backend:
+        raise SupersetResultsBackendNotConfigureException()
 
-    if store_results and not results_backend:
-        handle_error("Results backend isn't configured.")
-
-    # Limit enforced only for retrieving the data, not for the CTA queries.
-    superset_query = SupersetQuery(query.sql)
-    executed_sql = superset_query.stripped()
-    if not superset_query.is_select() and not database.allow_dml:
-        handle_error(
-            "Only `SELECT` statements are allowed against this database")
-    if query.select_as_cta:
-        if not superset_query.is_select():
-            handle_error(
-                "Only `SELECT` statements can be used with the CREATE TABLE "
-                "feature.")
-        if not query.tmp_table_name:
-            start_dttm = datetime.fromtimestamp(query.start_time)
-            query.tmp_table_name = 'tmp_{}_table_{}'.format(
-                query.user_id,
-                start_dttm.strftime('%Y_%m_%d_%H_%M_%S'))
-        executed_sql = superset_query.as_create_table(query.tmp_table_name)
-        query.select_as_cta_used = True
-    elif (
-            query.limit and superset_query.is_select() and
-            db_engine_spec.limit_method == LimitMethod.WRAP_SQL):
-        executed_sql = database.wrap_sql_limit(executed_sql, query.limit)
-        query.limit_used = True
-    try:
-        template_processor = get_template_processor(
-            database=database, query=query)
-        executed_sql = template_processor.process_template(executed_sql)
-        executed_sql = db_engine_spec.sql_preprocessor(executed_sql)
-    except Exception as e:
-        logging.exception(e)
-        msg = "Template rendering failed: " + utils.error_msg_from_exception(e)
-        handle_error(msg)
-
-    query.executed_sql = executed_sql
+    logger.info("Query %s: Set query to 'running'", str(query_id))
     query.status = QueryStatus.RUNNING
-    query.start_running_time = utils.now_as_float()
-    session.merge(query)
-    session.commit()
-    logging.info("Set query to 'running'")
+    query.start_running_time = now_as_float()
+    db.session.commit()
 
-    try:
-        engine = database.get_sqla_engine(schema=query.schema)
-        conn = engine.raw_connection()
-        cursor = conn.cursor()
-        logging.info("Running query: \n{}".format(executed_sql))
-        logging.info(query.executed_sql)
-        cursor.execute(
-            query.executed_sql, **db_engine_spec.cursor_execute_kwargs)
-    except Exception as e:
-        logging.exception(e)
-        conn.close()
-        handle_error(db_engine_spec.extract_error_message(e))
+    parsed_script = SQLScript(rendered_query, engine=db_engine_spec.engine)
 
-    try:
-        logging.info("Handling cursor")
-        db_engine_spec.handle_cursor(cursor, query, session)
-        logging.info("Fetching data: {}".format(query.to_dict()))
-        data = db_engine_spec.fetch_data(cursor, query.limit)
-    except Exception as e:
-        logging.exception(e)
-        conn.close()
-        handle_error(db_engine_spec.extract_error_message(e))
+    disallowed_functions = app.config["DISALLOWED_SQL_FUNCTIONS"].get(
+        db_engine_spec.engine,
+        set(),
+    )
+    if disallowed_functions and parsed_script.check_functions_present(
+        disallowed_functions
+    ):
+        raise SupersetDisallowedSQLFunctionException(disallowed_functions)
 
-    conn.commit()
-    conn.close()
+    disallowed_tables = app.config["DISALLOWED_SQL_TABLES"].get(
+        db_engine_spec.engine,
+        set(),
+    )
+    rls_enabled = is_feature_enabled("RLS_IN_SQLLAB")
 
-    if query.status == utils.QueryStatus.STOPPED:
-        return json.dumps({
-            'query_id': query.id,
-            'status': query.status,
-            'query': query.to_dict(),
-        }, default=utils.json_iso_dttm_ser)
+    # Resolve the effective per-query schema once and share it between the
+    # denylist check and RLS injection, but only when a control below needs it.
+    # Going through the query-aware ``get_default_schema_for_query`` (rather than
+    # the static ``get_default_schema``) resolves an unqualified reference to the
+    # schema the engine actually uses at runtime -- engines without dynamic-schema
+    # support ignore the request's selected schema -- so both controls match the
+    # execution path instead of a schema that may never apply.
+    effective_schema = ""
+    if disallowed_tables or rls_enabled:
+        effective_schema = database.get_default_schema_for_query(query)
 
-    column_names = (
-        [col[0] for col in cursor.description] if cursor.description else [])
-    column_names = dedup(column_names)
-    cdf = dataframe.SupersetDataFrame(pd.DataFrame(
-        list(data), columns=column_names))
+    if disallowed_tables:
+        # Report only the denylisted tables actually referenced in the query,
+        # honoring schema-qualified entries (e.g. ``information_schema.tables``).
+        found_tables = parsed_script.get_disallowed_tables(
+            disallowed_tables, effective_schema
+        )
+        if found_tables:
+            raise SupersetDisallowedSQLTableException(found_tables)
 
-    query.rows = cdf.size
-    query.progress = 100
-    query.status = QueryStatus.SUCCESS
+    if parsed_script.has_mutation() and not database.allow_dml:
+        raise SupersetDMLNotAllowedException()
+
+    if rls_enabled:
+        for statement in parsed_script.statements:
+            apply_rls(query.database, query.catalog, effective_schema, statement)
+
     if query.select_as_cta:
-        query.select_sql = '{}'.format(database.select_star(
-            query.tmp_table_name,
+        # CTAS is valid when the last statement is a SELECT, while CVAS is valid when
+        # there is only a single statement which must be a SELECT.
+        if (
+            query.ctas_method == CTASMethod.TABLE.name
+            and not parsed_script.is_valid_ctas()
+        ):
+            raise SupersetInvalidCTASException()
+        if (
+            query.ctas_method == CTASMethod.VIEW.name
+            and not parsed_script.is_valid_cvas()
+        ):
+            raise SupersetInvalidCVASException()
+
+        parsed_script.statements[-1] = apply_ctas(  # type: ignore
+            query,
+            parsed_script.statements[-1],
+        )
+        query.select_as_cta_used = True
+
+    for statement in parsed_script.statements:
+        apply_limit(query, statement)
+
+    # Build the execution blocks, applying `SQL_QUERY_MUTATOR` per
+    # `MUTATE_AFTER_SPLIT` (shared with the async path in `celery_task` so the
+    # `run_multiple_statements_as_one` × `MUTATE_AFTER_SPLIT` matrix behaves
+    # identically in both).
+    parsed_script, blocks = build_statement_blocks(
+        parsed_script, db_engine_spec, database
+    )
+
+    with database.get_raw_connection(
+        catalog=query.catalog,
+        schema=query.schema,
+        source=QuerySource.SQL_LAB,
+    ) as conn:
+        # Sharing a single connection and cursor across the
+        # execution of all statements (if many)
+        cursor = conn.cursor()
+
+        cancel_query_id = db_engine_spec.get_cancel_query_id(cursor, query)
+        if cancel_query_id is not None:
+            query.set_extra_json_key(QUERY_CANCEL_KEY, cancel_query_id)
+            db.session.commit()
+
+        block_count = len(blocks)
+        for i, block in enumerate(blocks):
+            # Check if stopped
+            db.session.refresh(query)
+            if query.status == QueryStatus.STOPPED:
+                payload.update({"status": query.status})
+                return payload
+
+            # Run statement
+            msg = __(
+                "Running block %(block_num)s out of %(block_count)s",
+                block_num=i + 1,
+                block_count=block_count,
+            )
+            logger.info("Query %s: %s", str(query_id), msg)
+            query.set_extra_json_key("progress", msg)
+            db.session.commit()
+
+            # Hook to allow environment-specific mutation (usually comments) to the SQL.
+            # `is_split` reflects whether this block is an individual statement: when
+            # the engine runs everything as one block the SQL is not split, otherwise
+            # each block is a single split-out statement. This lets `MUTATE_AFTER_SPLIT`
+            # decide correctly whether the mutator fires here.
+            query.executed_sql = database.mutate_sql_based_on_config(
+                block,
+                is_split=not db_engine_spec.run_multiple_statements_as_one,
+            )
+
+            try:
+                result_set = execute_query(query, cursor, log_params)
+            except SqlLabQueryStoppedException:
+                payload.update({"status": QueryStatus.STOPPED})
+                return payload
+            except Exception as ex:  # pylint: disable=broad-except
+                msg = str(ex)
+                prefix_message = (
+                    __(
+                        "Block %(block_num)s out of %(block_count)s",
+                        block_num=i + 1,
+                        block_count=block_count,
+                    )
+                    if block_count > 1
+                    else ""
+                )
+                payload = handle_query_error(ex, query, payload, prefix_message)
+                return payload
+
+        # Commit the connection so CTA queries will create the table and any DML.
+        if parsed_script.has_mutation() or query.select_as_cta:
+            conn.commit()
+
+    # Success, updating the query entry in database
+    query.rows = result_set.size
+    query.progress = 100
+    query.set_extra_json_key("progress", None)
+    query.set_extra_json_key("columns", result_set.columns)
+    if query.select_as_cta:
+        query.select_sql = database.select_star(
+            Table(query.tmp_table_name, query.tmp_schema_name),
             limit=query.limit,
-            schema=database.force_ctas_schema,
             show_cols=False,
             latest_partition=False,
-        ))
-    query.end_time = utils.now_as_float()
-    session.merge(query)
-    session.flush()
+        )
+    query.end_time = now_as_float()
 
-    payload = {
-        'query_id': query.id,
-        'status': query.status,
-        'data': cdf.data if cdf.data else [],
-        'columns': cdf.columns if cdf.columns else [],
-        'query': query.to_dict(),
-    }
-    payload = json.dumps(payload, default=utils.json_iso_dttm_ser)
+    use_arrow_data = store_results and cast(bool, results_backend_use_msgpack)
+    data, selected_columns, all_columns, expanded_columns = _serialize_and_expand_data(
+        result_set, db_engine_spec, use_arrow_data, expand_data
+    )
 
-    if store_results:
-        key = '{}'.format(uuid.uuid4())
-        logging.info("Storing results in results backend, key: {}".format(key))
-        results_backend.set(key, utils.zlib_compress(payload))
-        query.results_key = key
-        query.end_result_backend_time = utils.now_as_float()
+    # TODO: data should be saved separately from metadata (likely in Parquet)
+    payload.update(
+        {
+            "status": QueryStatus.SUCCESS,
+            "data": data,
+            "columns": all_columns,
+            "selected_columns": selected_columns,
+            "expanded_columns": expanded_columns,
+            "query": query.to_dict(),
+        }
+    )
+    payload["query"]["state"] = QueryStatus.SUCCESS
 
-    session.merge(query)
-    session.commit()
+    if store_results and results_backend:
+        key = str(uuid.uuid4())
+        payload["query"]["resultsKey"] = key
+        logger.info(
+            "Query %s: Storing results in results backend, key: %s", str(query_id), key
+        )
+        stats_logger = app.config["STATS_LOGGER"]
+        with stats_timing("sqllab.query.results_backend_write", stats_logger):
+            with stats_timing(
+                "sqllab.query.results_backend_write_serialization", stats_logger
+            ):
+                serialized_payload = _serialize_payload(
+                    payload, cast(bool, results_backend_use_msgpack)
+                )
+
+                # Check the size of the serialized payload
+                if sql_lab_payload_max_mb := app.config.get("SQLLAB_PAYLOAD_MAX_MB"):
+                    serialized_payload_size = sys.getsizeof(serialized_payload)
+                    max_bytes = sql_lab_payload_max_mb * BYTES_IN_MB
+
+                    if serialized_payload_size > max_bytes:
+                        logger.info("Result size exceeds the allowed limit.")
+                        raise SupersetErrorException(
+                            SupersetError(
+                                message=f"Result size ({serialized_payload_size / BYTES_IN_MB:.2f} MB) exceeds the allowed limit of {sql_lab_payload_max_mb} MB.",  # noqa: E501
+                                error_type=SupersetErrorType.RESULT_TOO_LARGE_ERROR,
+                                level=ErrorLevel.ERROR,
+                            )
+                        )
+
+            cache_timeout = database.cache_timeout
+            if cache_timeout is None:
+                cache_timeout = app.config["CACHE_DEFAULT_TIMEOUT"]
+
+            compressed = zlib_compress(serialized_payload)
+            logger.debug(
+                "*** serialized payload size: %i", getsizeof(serialized_payload)
+            )
+            logger.debug("*** compressed payload size: %i", getsizeof(compressed))
+
+            # Store results in backend and check if write succeeded
+            write_success = results_backend.set(key, compressed, cache_timeout)
+            if not write_success:
+                # Backend write failed - log error and don't set results_key
+                logger.error(
+                    "Query %s: Failed to store results in backend, key: %s",
+                    str(query_id),
+                    key,
+                )
+                stats_logger.incr("sqllab.results_backend.write_failure")
+                # Don't set results_key to prevent 410 errors when fetching
+                query.results_key = None
+
+                # For async queries (not returning results inline), mark as FAILED
+                # because results are inaccessible to the user
+                if not return_results:
+                    query.status = QueryStatus.FAILED
+                    query.error_message = (
+                        "Failed to store query results in the results backend. "
+                        "Please try again or contact your administrator."
+                    )
+                    db.session.commit()
+                    raise SupersetErrorException(
+                        SupersetError(
+                            message=__(
+                                "Failed to store query results. Please try again."
+                            ),
+                            error_type=SupersetErrorType.RESULTS_BACKEND_ERROR,
+                            level=ErrorLevel.ERROR,
+                        )
+                    )
+            else:
+                # Write succeeded - set results_key in database
+                query.results_key = key
+                logger.info(
+                    "Query %s: Successfully stored results in backend, key: %s",
+                    str(query_id),
+                    key,
+                )
+
+    # Only set SUCCESS if we didn't already set FAILED above
+    if query.status != QueryStatus.FAILED:
+        query.status = QueryStatus.SUCCESS
+    db.session.commit()
 
     if return_results:
+        # since we're returning results we need to create non-arrow data
+        if use_arrow_data:
+            (
+                data,
+                selected_columns,
+                all_columns,
+                expanded_columns,
+            ) = _serialize_and_expand_data(
+                result_set, db_engine_spec, False, expand_data
+            )
+            payload.update(
+                {
+                    "data": data,
+                    "columns": all_columns,
+                    "selected_columns": selected_columns,
+                    "expanded_columns": expanded_columns,
+                }
+            )
+        # Check the size of the serialized payload (opt-in logic for return_results)
+        if sql_lab_payload_max_mb := app.config.get("SQLLAB_PAYLOAD_MAX_MB"):
+            serialized_payload = _serialize_payload(
+                payload, cast(bool, results_backend_use_msgpack)
+            )
+            serialized_payload_size = sys.getsizeof(serialized_payload)
+            max_bytes = sql_lab_payload_max_mb * BYTES_IN_MB
+
+            if serialized_payload_size > max_bytes:
+                logger.info("Result size exceeds the allowed limit.")
+                raise SupersetErrorException(
+                    SupersetError(
+                        message=f"Result size ({serialized_payload_size / BYTES_IN_MB:.2f} MB) exceeds the allowed limit of {sql_lab_payload_max_mb} MB.",  # noqa: E501
+                        error_type=SupersetErrorType.RESULT_TOO_LARGE_ERROR,
+                        level=ErrorLevel.ERROR,
+                    )
+                )
         return payload
+
+    return None
+
+
+def cancel_query(query: Query) -> bool:
+    """
+    Cancel a running query.
+
+    Note some engines implicitly handle the cancelation of a query and thus no explicit
+    action is required.
+
+    :param query: Query to cancel
+    :return: True if query cancelled successfully, False otherwise
+    """
+
+    if query.database.db_engine_spec.has_implicit_cancel():
+        return True
+
+    # Some databases may need to make preparations for query cancellation
+    query.database.db_engine_spec.prepare_cancel_query(query)
+
+    if query.extra.get(QUERY_EARLY_CANCEL_KEY):
+        # Query has been cancelled prior to being able to set the cancel key.
+        # This can happen if the query cancellation key can only be acquired after the
+        # query has been executed
+        return True
+
+    cancel_query_id = query.extra.get(QUERY_CANCEL_KEY)
+    if cancel_query_id is None:
+        return False
+
+    with query.database.get_sqla_engine(
+        catalog=query.catalog,
+        schema=query.schema,
+        source=QuerySource.SQL_LAB,
+    ) as engine:
+        with closing(engine.raw_connection()) as conn:
+            with closing(conn.cursor()) as cursor:
+                return query.database.db_engine_spec.cancel_query(
+                    cursor, query, cancel_query_id
+                )

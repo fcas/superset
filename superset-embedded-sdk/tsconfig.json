@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    // syntax rules
+    "strict": true,
+
+    "moduleResolution": "bundler",
+
+    // environment
+    "target": "es6",
+    "lib": ["DOM", "ESNext"],
+    "module": "esnext",
+
+    // output
+    "outDir": "./dist",
+    "emitDeclarationOnly": true,
+    "declaration": true,
+
+    "types": ["node"]
+  },
+
+  "include": [
+    "src/**/*"
+  ],
+
+  "exclude": [
+    "src/**/*.test.ts",
+    "dist",
+    "lib",
+    "node_modules"
+  ]
+}

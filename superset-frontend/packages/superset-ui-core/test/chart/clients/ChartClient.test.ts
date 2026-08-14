@@ -1,0 +1,291 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import fetchMock from 'fetch-mock';
+import {
+  SupersetClientClass,
+  SupersetClient,
+  buildQueryContext,
+  QueryFormData,
+  ChartClient,
+  getChartBuildQueryRegistry,
+  getChartMetadataRegistry,
+  ChartMetadata,
+  VizType,
+} from '@superset-ui/core';
+import { configure as configureTranslation } from '@apache-superset/core/translation';
+
+import { LOGIN_GLOB } from '../fixtures/constants';
+import { sankeyFormData } from '../fixtures/formData';
+import { SliceIdAndOrFormData } from '../../../src/chart/clients/ChartClient';
+
+configureTranslation();
+
+beforeAll(() => fetchMock.mockGlobal());
+afterAll(() => fetchMock.hardReset());
+
+describe('ChartClient', () => {
+  let chartClient: ChartClient;
+
+  beforeAll(() => {
+    fetchMock.get(LOGIN_GLOB, { result: '1234' });
+    SupersetClient.reset();
+    SupersetClient.configure().init();
+  });
+
+  beforeEach(() => {
+    chartClient = new ChartClient();
+  });
+
+  afterEach(() => fetchMock.removeRoutes().clearHistory());
+
+  describe('new ChartClient(config)', () => {
+    test('creates a client without argument', () => {
+      expect(chartClient).toBeInstanceOf(ChartClient);
+    });
+    test('creates a client with specified config.client', () => {
+      const customClient = new SupersetClientClass();
+      chartClient = new ChartClient({ client: customClient });
+      expect(chartClient).toBeInstanceOf(ChartClient);
+      expect(chartClient.client).toBe(customClient);
+    });
+  });
+
+  describe('.loadFormData({ sliceId, formData }, options)', () => {
+    const sliceId = 123;
+    test('fetches formData if given only sliceId', () => {
+      fetchMock.get(
+        `glob:*/api/v1/form_data/?slice_id=${sliceId}`,
+        sankeyFormData,
+      );
+
+      return expect(chartClient.loadFormData({ sliceId })).resolves.toEqual(
+        sankeyFormData,
+      );
+    });
+    test('fetches formData from sliceId and merges with specify formData if both fields are specified', () => {
+      fetchMock.get(
+        `glob:*/api/v1/form_data/?slice_id=${sliceId}`,
+        sankeyFormData,
+      );
+
+      return expect(
+        chartClient.loadFormData({
+          sliceId,
+          formData: {
+            granularity: 'second',
+            viz_type: VizType.Bar,
+          },
+        }),
+      ).resolves.toEqual({
+        ...sankeyFormData,
+        granularity: 'second',
+        viz_type: VizType.Bar,
+      });
+    });
+    test('returns promise of formData if only formData was given', () =>
+      expect(
+        chartClient.loadFormData({
+          formData: {
+            datasource: '1__table',
+            granularity: 'minute',
+            viz_type: VizType.Line,
+          },
+        }),
+      ).resolves.toEqual({
+        datasource: '1__table',
+        granularity: 'minute',
+        viz_type: VizType.Line,
+      }));
+    test('rejects if none of sliceId or formData is specified', () =>
+      expect(
+        chartClient.loadFormData({} as SliceIdAndOrFormData),
+      ).rejects.toEqual(
+        new Error('At least one of sliceId or formData must be specified'),
+      ));
+  });
+
+  describe('.loadQueryData(formData, options)', () => {
+    test('returns a promise of query data for known chart type', async () => {
+      getChartMetadataRegistry().registerValue(
+        VizType.WordCloud,
+        new ChartMetadata({ name: 'Word Cloud', thumbnail: '' }),
+      );
+
+      getChartBuildQueryRegistry().registerValue(
+        VizType.WordCloud,
+        (formData: QueryFormData) => buildQueryContext(formData),
+      );
+      // The real /api/v1/chart/data endpoint wraps its results in
+      // `{ result: [...] }`, not a bare array.
+      fetchMock.post('glob:*/api/v1/chart/data', {
+        result: [
+          {
+            field1: 'abc',
+            field2: 'def',
+          },
+        ],
+      });
+
+      await expect(
+        chartClient.loadQueryData({
+          granularity: 'minute',
+          viz_type: VizType.WordCloud,
+          datasource: '1__table',
+        }),
+      ).resolves.toEqual([
+        {
+          field1: 'abc',
+          field2: 'def',
+        },
+      ]);
+
+      // The query context fields must be posted at the top level of the
+      // request body -- the endpoint's schema does not expect them nested
+      // under a `query_context` key.
+      const calls = fetchMock.callHistory.calls('glob:*/api/v1/chart/data');
+      const requestBody = JSON.parse(
+        (calls[0].options as RequestInit).body as string,
+      );
+      expect(requestBody.query_context).toBeUndefined();
+      expect(requestBody.datasource).toEqual({ id: 1, type: 'table' });
+    });
+    test('returns a promise that rejects for unknown chart type', () =>
+      expect(
+        chartClient.loadQueryData({
+          granularity: 'minute',
+          viz_type: 'rainbow_3d_pie',
+          datasource: '1__table',
+        }),
+      ).rejects.toEqual(new Error('Unknown chart type: rainbow_3d_pie')));
+  });
+
+  describe('.loadDatasource(datasourceKey, options)', () => {
+    test('fetches datasource', () => {
+      fetchMock.get('glob:*/fetch_datasource_metadata?datasourceKey=1__table', {
+        field1: 'abc',
+        field2: 'def',
+      });
+
+      return expect(chartClient.loadDatasource('1__table')).resolves.toEqual({
+        field1: 'abc',
+        field2: 'def',
+      });
+    });
+  });
+
+  describe('.loadAnnotation(annotationLayer)', () => {
+    test('returns an empty object if the annotation layer does not require query', () =>
+      expect(
+        chartClient.loadAnnotation({
+          name: 'my-annotation',
+        }),
+      ).resolves.toEqual({}));
+    test('otherwise returns a rejected promise because it is not implemented yet', () =>
+      expect(
+        chartClient.loadAnnotation({
+          name: 'my-annotation',
+          sourceType: 'abc',
+        }),
+      ).rejects.toEqual(new Error('This feature is not implemented yet.')));
+  });
+
+  describe('.loadAnnotations(annotationLayers)', () => {
+    test('loads multiple annotation layers and combine results', () =>
+      expect(
+        chartClient.loadAnnotations([
+          {
+            name: 'anno1',
+          },
+          {
+            name: 'anno2',
+          },
+          {
+            name: 'anno3',
+          },
+        ]),
+      ).resolves.toEqual({
+        anno1: {},
+        anno2: {},
+        anno3: {},
+      }));
+    test('returns an empty object if input is not an array', () =>
+      expect(chartClient.loadAnnotations()).resolves.toEqual({}));
+    test('returns an empty object if input is an empty array', () =>
+      expect(chartClient.loadAnnotations()).resolves.toEqual({}));
+  });
+
+  describe('.loadChartData({ sliceId, formData })', () => {
+    const sliceId = 10120;
+    test('loadAllDataNecessaryForAChart', () => {
+      fetchMock.get(`glob:*/api/v1/form_data/?slice_id=${sliceId}`, {
+        granularity: 'minute',
+        viz_type: VizType.Line,
+        datasource: '1__table',
+        color: 'living-coral',
+      });
+
+      fetchMock.get('glob:*/fetch_datasource_metadata?datasourceKey=1__table', {
+        name: 'transactions',
+        schema: 'staging',
+      });
+
+      fetchMock.post('glob:*/api/v1/chart/data', {
+        lorem: 'ipsum',
+        dolor: 'sit',
+        amet: true,
+      });
+
+      getChartMetadataRegistry().registerValue(
+        VizType.Line,
+        new ChartMetadata({ name: 'Line', thumbnail: '.gif' }),
+      );
+
+      getChartBuildQueryRegistry().registerValue(
+        VizType.Line,
+        (formData: QueryFormData) => buildQueryContext(formData),
+      );
+
+      return expect(
+        chartClient.loadChartData({
+          sliceId,
+        }),
+      ).resolves.toEqual({
+        annotationData: {},
+        datasource: {
+          name: 'transactions',
+          schema: 'staging',
+        },
+        formData: {
+          granularity: 'minute',
+          viz_type: VizType.Line,
+          datasource: '1__table',
+          color: 'living-coral',
+        },
+        queriesData: [
+          {
+            lorem: 'ipsum',
+            dolor: 'sit',
+            amet: true,
+          },
+        ],
+      });
+    });
+  });
+});

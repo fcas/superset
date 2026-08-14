@@ -1,0 +1,295 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+import logging
+from abc import abstractmethod
+from functools import partial
+from typing import Any, Optional, TypedDict
+
+import pandas as pd
+from flask import current_app
+from flask_babel import lazy_gettext as _
+from werkzeug.datastructures import FileStorage
+
+from superset import db
+from superset.commands.base import BaseCommand
+from superset.commands.database.exceptions import (
+    DatabaseNotFoundError,
+    DatabaseSchemaUploadNotAllowed,
+    DatabaseUploadFailed,
+    DatabaseUploadFileTooLarge,
+    DatabaseUploadNotSupported,
+    DatabaseUploadSaveMetadataFailed,
+    DatabaseUploadSoftDeletedDatasetExistsError,
+)
+from superset.connectors.sqla.models import SqlaTable
+from superset.daos.database import DatabaseDAO
+from superset.models.core import Database
+from superset.sql.parse import Table
+from superset.utils.backports import StrEnum
+from superset.utils.core import get_user
+from superset.utils.decorators import on_error, transaction
+from superset.views.database.validators import schema_allows_file_upload
+
+logger = logging.getLogger(__name__)
+
+READ_CHUNK_SIZE = 1000
+
+
+class UploadFileType(StrEnum):
+    CSV = "csv"
+    EXCEL = "excel"
+    COLUMNAR = "columnar"
+
+
+class ReaderOptions(TypedDict, total=False):
+    already_exists: str
+    index_label: str
+    dataframe_index: bool
+
+
+class FileMetadataItem(TypedDict):
+    sheet_name: Optional[str]
+    column_names: list[str]
+
+
+class FileMetadata(TypedDict, total=False):
+    items: list[FileMetadataItem]
+
+
+class BaseDataReader:
+    """
+    Base class for reading data from a file and uploading it to a database
+    These child objects are used by the UploadCommand as a dependency injection
+    to read data from multiple file types (e.g. CSV, Excel, etc.)
+    """
+
+    def __init__(self, options: Optional[dict[str, Any]] = None) -> None:
+        self._options = options or {}
+
+    @abstractmethod
+    def file_to_dataframe(self, file: FileStorage) -> pd.DataFrame: ...
+
+    @abstractmethod
+    def file_metadata(self, file: FileStorage) -> FileMetadata: ...
+
+    def read(
+        self,
+        file: FileStorage,
+        database: Database,
+        table_name: str,
+        schema_name: Optional[str],
+    ) -> None:
+        self._dataframe_to_database(
+            self.file_to_dataframe(file), database, table_name, schema_name
+        )
+
+    def _dataframe_to_database(
+        self,
+        df: pd.DataFrame,
+        database: Database,
+        table_name: str,
+        schema_name: Optional[str],
+    ) -> None:
+        """
+        Upload DataFrame to database
+
+        :param df:
+        :throws DatabaseUploadFailed: if there is an error uploading the DataFrame
+        """
+        try:
+            data_table = Table(table=table_name, schema=schema_name)
+            to_sql_kwargs = {
+                "chunksize": READ_CHUNK_SIZE,
+                "if_exists": self._options.get("already_exists", "fail"),
+                "index": self._options.get("dataframe_index", False),
+            }
+            if self._options.get("index_label") and self._options.get(
+                "dataframe_index"
+            ):
+                to_sql_kwargs["index_label"] = self._options.get("index_label")
+            database.db_engine_spec.df_to_sql(
+                database,
+                data_table,
+                df,
+                to_sql_kwargs=to_sql_kwargs,
+            )
+        except ValueError as ex:
+            raise DatabaseUploadFailed(
+                message=_(
+                    "Table already exists. You can change your "
+                    "'if table already exists' strategy to append or "
+                    "replace or provide a different Table Name to use."
+                )
+            ) from ex
+        except Exception as ex:
+            message = ex.message if hasattr(ex, "message") and ex.message else str(ex)
+            raise DatabaseUploadFailed(message=message, exception=ex) from ex
+
+
+class UploadCommand(BaseCommand):
+    def __init__(  # pylint: disable=too-many-arguments
+        self,
+        model_id: int,
+        table_name: str,
+        file: Any,
+        schema: Optional[str],
+        reader: BaseDataReader,
+    ) -> None:
+        self._model_id = model_id
+        self._model: Optional[Database] = None
+        self._table_name = table_name
+        self._schema = schema
+        self._file = file
+        self._reader = reader
+
+    @transaction(on_error=partial(on_error, reraise=DatabaseUploadSaveMetadataFailed))
+    def run(self) -> None:
+        self.validate()
+        if not self._model:
+            return
+
+        self._table_name, self._schema = (
+            self._model.db_engine_spec.normalize_table_name_for_upload(
+                self._table_name, self._schema
+            )
+        )
+
+        sqla_table = (
+            db.session.query(SqlaTable)
+            .filter_by(
+                table_name=self._table_name,
+                schema=self._schema,
+                database_id=self._model_id,
+            )
+            .one_or_none()
+        )
+        if not sqla_table:
+            from superset.subjects.utils import get_user_subject
+
+            user = get_user()
+            editors = []
+            if user:
+                subj = get_user_subject(user.id)
+                if subj:
+                    editors.append(subj)
+
+            # The lookup above runs through the soft-delete visibility filter,
+            # so a soft-deleted dataset over this table is invisible here.
+            # Without this guard the upload would create an active twin of the
+            # hidden row — permanently blocking its restore — or die on the
+            # legacy unique constraint. Check BEFORE ``reader.read`` writes
+            # the file's contents into the analytics database: that write is
+            # outside this command's metadata transaction and would not roll
+            # back. With SOFT_DELETE off, leftover soft-deleted rows are
+            # visible to the lookup above, so this branch is never reached
+            # for them (degraded-mode semantics, consistent with the create
+            # paths).
+            # Deferred import: daos.dataset pulls in views.base, which
+            # circularly imports back into the commands package at app init
+            # (same constraint documented in daos/dataset.py re: PR #40573).
+            from superset.daos.dataset import (  # noqa: PLC0415
+                DatasetDAO,
+            )
+
+            if soft_twin := DatasetDAO.find_soft_deleted_logical_duplicate(
+                self._model, Table(self._table_name, self._schema)
+            ):
+                raise DatabaseUploadSoftDeletedDatasetExistsError(str(soft_twin.uuid))
+
+        self._reader.read(self._file, self._model, self._table_name, self._schema)
+
+        if not sqla_table:
+            sqla_table = SqlaTable(
+                table_name=self._table_name,
+                database=self._model,
+                database_id=self._model_id,
+                editors=editors,
+                schema=self._schema,
+            )
+            db.session.add(sqla_table)
+
+        sqla_table.fetch_metadata()
+
+    @staticmethod
+    def _file_size_bytes(file: Any) -> Optional[int]:
+        """
+        Return the size of an uploaded file without consuming its stream.
+
+        Returns ``None`` when the stream is not seekable, in which case the
+        size cannot be determined cheaply and the size check is skipped in
+        favour of downstream guards.
+        """
+        stream = getattr(file, "stream", file)
+        try:
+            position = stream.tell()
+            stream.seek(0, 2)  # seek to end
+            size = stream.tell()
+            stream.seek(position)  # restore the original position
+        except (AttributeError, OSError):
+            return None
+        return size
+
+    @classmethod
+    def validate_file_size(cls, file: Any) -> None:
+        """
+        Reject a file whose size exceeds ``UPLOAD_MAX_FILE_SIZE_BYTES``.
+
+        Shared by the upload command and the metadata endpoint so oversized
+        files are rejected before their contents are read into memory,
+        regardless of which path is used.
+
+        :raises DatabaseUploadFileTooLarge: if the file is larger than the limit
+        """
+        max_file_size = current_app.config.get("UPLOAD_MAX_FILE_SIZE_BYTES")
+        if max_file_size is None or file is None:
+            return
+        size = cls._file_size_bytes(file)
+        if size is not None and size > max_file_size:
+            raise DatabaseUploadFileTooLarge()
+
+    @staticmethod
+    def _resolve_default_schema(database: Database) -> Optional[str]:
+        """Resolve the database's default schema so uploaded datasets carry an
+        explicit schema instead of NULL, which would otherwise duplicate an
+        existing dataset over the same table (see #36305)."""
+        try:
+            return database.get_default_schema(database.get_default_catalog())
+        except Exception:  # pylint: disable=broad-except
+            # Resolution opens an inspector connection; a failure here must
+            # degrade to the no-schema behavior rather than fail the upload.
+            logger.warning(
+                "Unable to resolve default schema for upload; proceeding without one",
+                exc_info=True,
+            )
+            return None
+
+    def validate(self) -> None:
+        self._model = DatabaseDAO.find_by_id(self._model_id)
+        if not self._model:
+            raise DatabaseNotFoundError()
+        engine_resolved = False
+        if not self._schema:
+            self._schema = self._resolve_default_schema(self._model)
+            engine_resolved = self._schema is not None
+        if not schema_allows_file_upload(
+            self._model, self._schema, engine_resolved=engine_resolved
+        ):
+            raise DatabaseSchemaUploadNotAllowed()
+        if not self._model.db_engine_spec.supports_file_upload:
+            raise DatabaseUploadNotSupported()
+
+        self.validate_file_size(self._file)

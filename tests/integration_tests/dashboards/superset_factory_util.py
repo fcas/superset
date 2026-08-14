@@ -1,0 +1,367 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+import logging
+from typing import Optional
+
+from flask_appbuilder import Model
+from flask_appbuilder.security.sqla.models import User
+
+from superset import db
+from superset.connectors.sqla.models import SqlaTable
+from superset.constants import SKIP_VISIBILITY_FILTER_CLASSES
+from superset.models.core import Database
+from superset.models.dashboard import Dashboard
+from superset.models.slice import Slice
+from superset.subjects.models import (
+    chart_editors,
+    dashboard_editors,
+    dashboard_viewers,
+    sqlatable_editors,
+)
+from tests.integration_tests.dashboards.dashboard_test_utils import (
+    random_slug,
+    random_str,
+    random_title,
+)
+
+logger = logging.getLogger(__name__)
+
+inserted_dashboards_ids = []
+inserted_databases_ids = []
+inserted_sqltables_ids = []
+inserted_slices_ids = []
+
+
+def create_dashboard_to_db(
+    dashboard_title: Optional[str] = None,
+    slug: Optional[str] = None,
+    published: bool = False,
+    editors: Optional[list[User]] = None,
+    slices: Optional[list[Slice]] = None,
+    css: str = "",
+    json_metadata: str = "",
+    position_json: str = "",
+) -> Dashboard:
+    dashboard = create_dashboard(
+        dashboard_title,
+        slug,
+        published,
+        editors,
+        slices,
+        css,
+        json_metadata,
+        position_json,
+    )
+
+    insert_model(dashboard)
+    inserted_dashboards_ids.append(dashboard.id)
+    return dashboard
+
+
+def create_dashboard(
+    dashboard_title: Optional[str] = None,
+    slug: Optional[str] = None,
+    published: bool = False,
+    editors: Optional[list[User]] = None,
+    slices: Optional[list[Slice]] = None,
+    css: str = "",
+    json_metadata: str = "",
+    position_json: str = "",
+) -> Dashboard:
+    from tests.integration_tests.base_tests import subjects_from_users
+
+    dashboard_title = dashboard_title if dashboard_title is not None else random_title()
+    slug = slug if slug is not None else random_slug()
+    slices = slices if slices is not None else []
+    dashboard = Dashboard(
+        dashboard_title=dashboard_title,
+        slug=slug,
+        published=published,
+        css=css,
+        position_json=position_json,
+        json_metadata=json_metadata,
+        slices=slices,
+    )
+    if editors:
+        dashboard.editors = subjects_from_users(editors)
+    return dashboard
+
+
+def insert_model(dashboard: Model) -> None:
+    db.session.add(dashboard)
+    db.session.commit()
+    db.session.refresh(dashboard)
+
+
+def create_slice_to_db(
+    name: Optional[str] = None,
+    datasource_id: Optional[int] = None,
+    editors: Optional[list[User]] = None,
+) -> Slice:
+    slice_ = create_slice(datasource_id, name=name, editors=editors)
+    insert_model(slice_)
+    inserted_slices_ids.append(slice_.id)
+    return slice_
+
+
+def create_slice(
+    datasource_id: Optional[int] = None,
+    datasource: Optional[SqlaTable] = None,
+    name: Optional[str] = None,
+    editors: Optional[list[User]] = None,
+) -> Slice:
+    from tests.integration_tests.base_tests import subjects_from_users
+
+    name = name if name is not None else random_str()
+    editor_subjects = subjects_from_users(editors) if editors else []
+    datasource_type = "table"
+    if datasource:
+        return Slice(
+            slice_name=name,
+            table=datasource,
+            editors=editor_subjects,
+            datasource_type=datasource_type,
+        )
+
+    datasource_id = (
+        datasource_id
+        if datasource_id is not None
+        else create_datasource_table_to_db(name=name + "_table").id
+    )
+
+    return Slice(
+        slice_name=name,
+        datasource_id=datasource_id,
+        editors=editor_subjects,
+        datasource_type=datasource_type,
+    )
+
+
+def create_datasource_table_to_db(
+    name: Optional[str] = None,
+    db_id: Optional[int] = None,
+    editors: Optional[list[User]] = None,
+) -> SqlaTable:
+    sqltable = create_datasource_table(name, db_id, editors=editors)
+    insert_model(sqltable)
+    inserted_sqltables_ids.append(sqltable.id)
+    return sqltable
+
+
+def create_datasource_table(
+    name: Optional[str] = None,
+    db_id: Optional[int] = None,
+    database: Optional[Database] = None,
+    editors: Optional[list[User]] = None,
+) -> SqlaTable:
+    from tests.integration_tests.base_tests import subjects_from_users
+
+    name = name if name is not None else random_str()
+    editor_subjects = subjects_from_users(editors) if editors else []
+    if database:
+        return SqlaTable(table_name=name, database=database, editors=editor_subjects)
+    db_id = db_id if db_id is not None else create_database_to_db(name=name + "_db").id
+    return SqlaTable(table_name=name, database_id=db_id, editors=editor_subjects)
+
+
+def create_database_to_db(name: Optional[str] = None) -> Database:
+    database = create_database(name)
+    insert_model(database)
+    inserted_databases_ids.append(database.id)
+    return database
+
+
+def create_database(name: Optional[str] = None) -> Database:
+    name = name if name is not None else random_str()
+    return Database(database_name=name, sqlalchemy_uri="sqlite:///:memory:")
+
+
+def delete_all_inserted_objects() -> None:
+    delete_all_inserted_dashboards()
+    delete_all_inserted_slices()
+    delete_all_inserted_tables()
+    delete_all_inserted_dbs()
+
+
+def delete_all_inserted_dashboards():
+    try:
+        # Expire all objects to ensure fresh state after potential rollbacks
+        db.session.expire_all()
+        dashboards_to_delete: list[Dashboard] = (
+            db.session.query(Dashboard)
+            .execution_options(**{SKIP_VISIBILITY_FILTER_CLASSES: {Dashboard}})
+            .filter(Dashboard.id.in_(inserted_dashboards_ids))
+            .all()
+        )
+        for dashboard in dashboards_to_delete:
+            try:
+                delete_dashboard(dashboard, False)
+            except Exception:
+                logger.error("failed to delete %s", dashboard.id, exc_info=True)
+                raise
+        if len(inserted_dashboards_ids) > 0:
+            db.session.commit()
+            inserted_dashboards_ids.clear()
+    except Exception:
+        logger.error("delete_all_inserted_dashboards failed", exc_info=True)
+        raise
+
+
+def delete_dashboard(dashboard: Dashboard, do_commit: bool = False) -> None:
+    logger.info("deleting dashboard%s", dashboard.id)
+    delete_dashboard_editor_associations(dashboard)
+    delete_dashboard_viewer_associations(dashboard)
+    delete_dashboard_slices_associations(dashboard)
+    db.session.delete(dashboard)
+    if do_commit:
+        db.session.commit()
+
+
+def delete_dashboard_editor_associations(dashboard: Dashboard) -> None:
+    db.session.execute(
+        dashboard_editors.delete().where(
+            dashboard_editors.c.dashboard_id == dashboard.id
+        )
+    )
+
+
+def delete_dashboard_viewer_associations(dashboard: Dashboard) -> None:
+    db.session.execute(
+        dashboard_viewers.delete().where(
+            dashboard_viewers.c.dashboard_id == dashboard.id
+        )
+    )
+
+
+def delete_dashboard_slices_associations(dashboard: Dashboard) -> None:
+    # Clear the M2M through the ORM relationship rather than a Core-level
+    # ``dashboard_slices.delete()``. ``dashboard_slices`` is a Continuum-tracked
+    # (versioned) association table: a raw Core delete fires Continuum's engine
+    # ``before_execute`` listener with no unit-of-work registered for the
+    # connection (no ORM flush happened), which raises ``KeyError`` when version
+    # capture is on. Clearing via the relationship routes through the ORM flush —
+    # the same path production dashboard deletes take — so capture tracks it
+    # cleanly. The other association helpers stay Core-level: their tables are
+    # not versioned, so Continuum ignores them.
+    dashboard.slices = []
+    db.session.flush()
+
+
+def delete_all_inserted_slices():
+    try:
+        # Slice bypass is a no-op until Slice adopts SoftDeleteMixin
+        # (charts soft-delete branch); kept here so the cleanup helper
+        # stays correct after that branch lands.
+        slices_to_delete: list[Slice] = (
+            db.session.query(Slice)
+            .execution_options(**{SKIP_VISIBILITY_FILTER_CLASSES: {Slice}})
+            .filter(Slice.id.in_(inserted_slices_ids))
+            .all()
+        )
+        for slice in slices_to_delete:
+            try:
+                delete_slice(slice, False)
+            except Exception:
+                logger.error("failed to delete %s", slice.id, exc_info=True)
+                raise
+        if len(inserted_slices_ids) > 0:
+            db.session.commit()
+            inserted_slices_ids.clear()
+    except Exception:
+        logger.error("delete_all_inserted_slices failed", exc_info=True)
+        raise
+
+
+def delete_slice(slice_: Slice, do_commit: bool = False) -> None:
+    logger.info("deleting slice%s", slice_.id)
+    delete_slice_editor_associations(slice_)
+    db.session.delete(slice_)
+    if do_commit:
+        db.session.commit()
+
+
+def delete_slice_editor_associations(slice_: Slice) -> None:
+    db.session.execute(
+        chart_editors.delete().where(chart_editors.c.chart_id == slice_.id)
+    )
+
+
+def delete_all_inserted_tables():
+    try:
+        # SqlaTable bypass is a no-op until SqlaTable adopts
+        # SoftDeleteMixin (datasets soft-delete branch); kept here so the
+        # cleanup helper stays correct after that branch lands.
+        tables_to_delete: list[SqlaTable] = (
+            db.session.query(SqlaTable)
+            .execution_options(**{SKIP_VISIBILITY_FILTER_CLASSES: {SqlaTable}})
+            .filter(SqlaTable.id.in_(inserted_sqltables_ids))
+            .all()
+        )
+        for table in tables_to_delete:
+            try:
+                delete_sqltable(table, False)
+            except Exception:
+                logger.error("failed to delete %s", table.id, exc_info=True)
+                raise
+        if len(inserted_sqltables_ids) > 0:
+            db.session.commit()
+            inserted_sqltables_ids.clear()
+    except Exception:
+        logger.error("delete_all_inserted_tables failed", exc_info=True)
+        raise
+
+
+def delete_sqltable(table: SqlaTable, do_commit: bool = False) -> None:
+    logger.info("deleting table%s", table.id)
+    delete_table_editor_associations(table)
+    db.session.delete(table)
+    if do_commit:
+        db.session.commit()
+
+
+def delete_table_editor_associations(table: SqlaTable) -> None:
+    db.session.execute(
+        sqlatable_editors.delete().where(sqlatable_editors.c.table_id == table.id)
+    )
+
+
+def delete_all_inserted_dbs():
+    try:
+        databases_to_delete: list[Database] = (
+            db.session.query(Database)
+            .filter(Database.id.in_(inserted_databases_ids))
+            .all()
+        )
+        for database in databases_to_delete:
+            try:
+                delete_database(database, False)
+            except Exception:
+                logger.error("failed to delete %s", database.id, exc_info=True)
+                raise
+        if len(inserted_databases_ids) > 0:
+            db.session.commit()
+            inserted_databases_ids.clear()
+    except Exception:
+        logger.error("delete_all_inserted_databases failed", exc_info=True)
+        raise
+
+
+def delete_database(database: Database, do_commit: bool = False) -> None:
+    logger.info("deleting database%s", database.id)
+    db.session.delete(database)
+    if do_commit:
+        db.session.commit()
