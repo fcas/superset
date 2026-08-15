@@ -5,5 +5,4 @@ updates:
     pull-request-branch-name:
       separator: "-"
     schedule:
-      interval: "cron"
-      cron: "34 10 * * *"
+      interval: "daily"
