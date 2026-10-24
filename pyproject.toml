@@ -94,7 +94,7 @@ dependencies = [
     "parsedatetime",
     "paramiko>=3.4.0, <4.0", # 4.0 removed DSSKey, still referenced by sshtunnel
     "pgsanity",
-    "Pillow>=11.0.0, <13",
+    "Pillow>=11.0.0, <14",
     "polyline>=2.0.4, <3.0",
     "pydantic>=2.8.0",
     "pyparsing>=3.3.2, <4",
